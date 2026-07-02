@@ -13,3 +13,4 @@ analysis/04_lad_analysis/__pycache__/*
 analysis/03_chromatin_analysis/__pycache__/*
 analysis/02_synthetic_analysis/__pycache__/*
 analysis/01_region_calling_analysis/__pycache__/*
+analysis/02_synthetic_analysis/debug_slurm_pipeline_run/*

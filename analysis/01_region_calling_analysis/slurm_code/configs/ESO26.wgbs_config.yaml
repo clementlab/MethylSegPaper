@@ -1,0 +1,3 @@
+genome: hg38
+meth_file: /uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/data/methylation_data/ESO26.wgbs.bed.gz
+sample: ESO26.wgbs

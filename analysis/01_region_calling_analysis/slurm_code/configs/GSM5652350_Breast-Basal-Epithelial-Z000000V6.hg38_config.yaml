@@ -1,0 +1,3 @@
+genome: hg38
+meth_file: /uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/data/methylation_data/GSM5652350_Breast-Basal-Epithelial-Z000000V6.hg38.beta
+sample: GSM5652350_Breast-Basal-Epithelial-Z000000V6.hg38
