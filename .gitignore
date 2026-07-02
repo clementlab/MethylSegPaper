@@ -1,0 +1,15 @@
+test_*
+get_data/*
+data/*
+results
+figures/out/*
+figures/logs/*
+old_code/*
+__pycache__/*
+figures/utils/__pycache__/*
+figures/__pycache__/*
+analysis/05_tcga_classification_analysis/slurm_code/__pycache__/*
+analysis/04_lad_analysis/__pycache__/*
+analysis/03_chromatin_analysis/__pycache__/*
+analysis/02_synthetic_analysis/__pycache__/*
+analysis/01_region_calling_analysis/__pycache__/*
