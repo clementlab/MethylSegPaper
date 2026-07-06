@@ -116,3 +116,7 @@ mirror the numbered workflow areas in `analysis/`.
 
 For workflow debugging and development, several analysis folders also contain
 test or exploratory notebooks alongside the Python entrypoints.
+
+TODO: move figure outputs out of results folder and into figures/out
+
+Fix bug in methylseg 450k where it will call a region over the centromere with almost no data

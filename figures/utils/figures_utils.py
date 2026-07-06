@@ -22,6 +22,7 @@ CANONICAL_CHROMS = frozenset(
     [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
 )
 RESULTS_DIR = Path("/uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/results")
+OUT_DIR = Path("/uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/figures/out")
 REFERENCE_DATA_DIR = DATA_DIR / "reference_data"
 METHYLSEG_RESULTS_DIR = RESULTS_DIR / "01_region_calling_analysis" / "methylseg"
 TOOL_REGISTRY = [
