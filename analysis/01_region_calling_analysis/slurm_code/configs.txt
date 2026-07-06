@@ -1,7 +1,4 @@
 /uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/analysis/01_region_calling_analysis/slurm_code/configs/SRR26107673_config.yaml
-/uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/analysis/01_region_calling_analysis/slurm_code/configs/WGBS_colon-primary-normal_1_meth_config.yaml
-/uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/analysis/01_region_calling_analysis/slurm_code/configs/WGBS_colon-primary-normal_2_meth_config.yaml
-/uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/analysis/01_region_calling_analysis/slurm_code/configs/WGBS_colon-primary-normal_3_meth_config.yaml
 /uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/analysis/01_region_calling_analysis/slurm_code/configs/WGBS_colon-primary-tumor_1_meth_config.yaml
 /uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/analysis/01_region_calling_analysis/slurm_code/configs/WGBS_colon-primary-tumor_2_meth_config.yaml
 /uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/analysis/01_region_calling_analysis/slurm_code/configs/WGBS_colon-primary-tumor_3_meth_config.yaml

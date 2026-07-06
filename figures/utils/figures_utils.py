@@ -7,7 +7,9 @@ import subprocess
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyBigWig
 import seaborn as sns
+import yaml
 
 
 DATA_DIR = Path(
@@ -20,6 +22,8 @@ CANONICAL_CHROMS = frozenset(
     [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
 )
 RESULTS_DIR = Path("/uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/results")
+REFERENCE_DATA_DIR = DATA_DIR / "reference_data"
+METHYLSEG_RESULTS_DIR = RESULTS_DIR / "01_region_calling_analysis" / "methylseg"
 TOOL_REGISTRY = [
     {
         "tool": "methylseg",
@@ -141,6 +145,52 @@ TOOL_REGISTRY = [
     },
 ]
 
+IGV_EXPORT_TOOL_ORDER = [
+    "methylseg_wgbs",
+    "methylseg_hm450k",
+    "methylseekr",
+    "dnmtools",
+    "dnmtools_array",
+    "dnmtools_pmr",
+    "mmseekr",
+    "methylasso",
+]
+
+TOOL_ALIASES = {
+    "methylseg": "methylseg_wgbs",
+    "methylseg_wgbs": "methylseg_wgbs",
+    "methylseg_hm450k": "methylseg_hm450k",
+    "methylseekr": "methylseekr",
+    "dnmtools": "dnmtools",
+    "dnmtools_array": "dnmtools_array",
+    "dnmtools_pmr": "dnmtools_pmr",
+    "mmseekr": "mmseekr",
+    "methyl_lasso": "methylasso",
+    "methylasso": "methylasso",
+}
+
+CANONICAL_TOOL_BY_EXPORT_SLUG = {
+    "methylseg_wgbs": "methylseg",
+    "methylseg_hm450k": "methylseg_hm450k",
+    "methylseekr": "methylseekr",
+    "dnmtools": "dnmtools",
+    "dnmtools_array": "dnmtools_array",
+    "dnmtools_pmr": "dnmtools_pmr",
+    "mmseekr": "mmseekr",
+    "methylasso": "methyl_lasso",
+}
+
+REGION_TYPE_BY_EXPORT_SLUG = {
+    "methylseg_wgbs": "pmd",
+    "methylseg_hm450k": "pmd",
+    "methylseekr": "pmd",
+    "dnmtools": "pmd",
+    "dnmtools_array": "pmd",
+    "dnmtools_pmr": "pmr",
+    "mmseekr": "pmd",
+    "methylasso": "pmd",
+}
+
 def wgbs_cancer_samples() -> list[str]:
     return [
         "ESO26.wgbs",
@@ -184,6 +234,49 @@ def _standardize_region_df(df: pd.DataFrame) -> pd.DataFrame:
     df["start"] = df["start"].astype(np.int64)
     df["end"] = df["end"].astype(np.int64)
     df = df.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+    return df
+
+
+def _standardize_beta_track_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = df.rename(
+        columns={
+            "chr": "chrom",
+            "CpG_chrm": "chrom",
+            "CpG_beg": "start",
+            "CpG_start": "start",
+            "CpG_end": "end",
+        }
+    )
+    missing_cols = [col for col in ["chrom", "start", "end", "beta"] if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Beta track is missing required columns {missing_cols}.")
+
+    df["chrom"] = df["chrom"].astype(str)
+    df["chrom"] = "chr" + df["chrom"].str.replace("^chr", "", regex=True)
+    df["start"] = pd.to_numeric(df["start"], errors="coerce")
+    df["end"] = pd.to_numeric(df["end"], errors="coerce")
+    df["beta"] = pd.to_numeric(df["beta"], errors="coerce")
+    df = df[df["chrom"].isin(CANONICAL_CHROMS)].copy()
+    df = df.dropna(subset=["chrom", "start", "end", "beta"])
+    invalid_beta = ~df["beta"].between(0.0, 1.0)
+    if invalid_beta.any():
+        raise ValueError(
+            f"Found {int(invalid_beta.sum())} beta values outside [0, 1] while preparing an IGV track."
+        )
+    df["start"] = df["start"].astype(np.int64)
+    df["end"] = df["end"].astype(np.int64)
+    df = df[["chrom", "start", "end", "beta"]].copy()
+
+    conflicting_dups = (
+        df.groupby(["chrom", "start", "end"], sort=False)["beta"].nunique(dropna=False) > 1
+    )
+    if conflicting_dups.any():
+        raise ValueError(
+            "Found duplicated methylation intervals with conflicting beta values while preparing an IGV track."
+        )
+
+    df = df.drop_duplicates(subset=["chrom", "start", "end"]).reset_index(drop=True)
     return df
 
 
@@ -349,6 +442,154 @@ def _get_tool_config(tool: str) -> dict:
             return tool_config
     raise ValueError(f"Unknown tool {tool!r}.")
 
+
+def igv_export_tool_slugs() -> list[str]:
+    return list(IGV_EXPORT_TOOL_ORDER)
+
+
+def normalize_tool_slug(tool: str) -> str:
+    normalized = TOOL_ALIASES.get(str(tool))
+    if normalized is None:
+        raise ValueError(
+            f"Unknown tool {tool!r}. Expected one of {sorted(TOOL_ALIASES)}."
+        )
+    return normalized
+
+
+def region_type_for_tool(tool: str) -> str:
+    return REGION_TYPE_BY_EXPORT_SLUG[normalize_tool_slug(tool)]
+
+
+def _canonical_tool_name(tool: str) -> str:
+    return CANONICAL_TOOL_BY_EXPORT_SLUG[normalize_tool_slug(tool)]
+
+
+def get_methylseg_prep_dir(sample_id: str) -> Path:
+    prep_dir = METHYLSEG_RESULTS_DIR / sample_id / "prep"
+    if not prep_dir.is_dir():
+        raise FileNotFoundError(
+            f"MethylSeg prep directory not found for sample_id={sample_id!r}: {prep_dir}"
+        )
+    return prep_dir
+
+
+def _get_prep_input_path(sample_id: str, filename: str) -> Path:
+    input_path = get_methylseg_prep_dir(sample_id) / filename
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"Expected prep file {filename!r} for sample_id={sample_id!r}: {input_path}"
+        )
+    return input_path
+
+
+def _load_prep_config(sample_id: str) -> dict:
+    config_path = _get_prep_input_path(sample_id, "config.yaml")
+    with open(config_path) as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _get_sample_genome(sample_id: str) -> str:
+    config = _load_prep_config(sample_id)
+    genome = config.get("genome")
+    return str(genome) if genome else _infer_genome(sample_id)
+
+
+def _load_chrom_sizes(genome: str) -> list[tuple[str, int]]:
+    chrom_sizes_path = REFERENCE_DATA_DIR / f"{genome}.chrom.sizes"
+    if not chrom_sizes_path.exists():
+        raise FileNotFoundError(
+            f"Chrom sizes file not found for genome={genome!r}: {chrom_sizes_path}"
+        )
+
+    chrom_sizes = []
+    with open(chrom_sizes_path) as fh:
+        for line in fh:
+            chrom, size = line.rstrip().split("\t")[:2]
+            chrom_sizes.append((chrom, int(size)))
+    return chrom_sizes
+
+
+def _sort_intervals_by_chrom_order(
+    df: pd.DataFrame,
+    chrom_col: str,
+    start_col: str,
+    chrom_sizes: list[tuple[str, int]],
+) -> pd.DataFrame:
+    chrom_order = [chrom for chrom, _ in chrom_sizes]
+    out_df = df[df[chrom_col].isin(chrom_order)].copy()
+    out_df[chrom_col] = pd.Categorical(out_df[chrom_col], categories=chrom_order, ordered=True)
+    out_df = out_df.sort_values([chrom_col, start_col, "end" if "end" in out_df.columns else start_col])
+    out_df[chrom_col] = out_df[chrom_col].astype(str)
+    return out_df.reset_index(drop=True)
+
+
+def _load_prep_beta_track(sample_id: str, track: str) -> tuple[pd.DataFrame, str]:
+    if track == "wgbs":
+        filename = "wgbs.beta"
+    elif track == "hm450k":
+        filename = "450k.beta"
+    else:
+        raise ValueError(f"Unsupported methylation track {track!r}.")
+
+    beta_path = _get_prep_input_path(sample_id, filename)
+    with open(beta_path) as fh:
+        header_fields = fh.readline().rstrip("\n").split("\t")
+
+    has_header = header_fields[:4] == ["chrom", "start", "end", "beta"]
+    if has_header:
+        df = pd.read_csv(beta_path, sep="\t")
+    else:
+        n_cols = len(header_fields)
+        if n_cols < 4:
+            raise ValueError(
+                f"Unsupported beta track with fewer than 4 columns: {beta_path}"
+            )
+        column_names = ["chrom", "start", "end", "beta"] + [
+            f"extra_{idx}" for idx in range(n_cols - 4)
+        ]
+        df = pd.read_csv(beta_path, sep="\t", header=None, names=column_names)
+    return _standardize_beta_track_df(df), _get_sample_genome(sample_id)
+
+
+def _write_bigwig(
+    beta_df: pd.DataFrame,
+    out_path: Path,
+    chrom_sizes: list[tuple[str, int]],
+) -> Path:
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ordered_df = _sort_intervals_by_chrom_order(beta_df, "chrom", "start", chrom_sizes)
+    chrom_size_map = dict(chrom_sizes)
+    out_of_bounds = ordered_df["end"] > ordered_df["chrom"].map(chrom_size_map)
+    if out_of_bounds.any():
+        raise ValueError(
+            f"Found {int(out_of_bounds.sum())} intervals extending past chromosome bounds for {out_path}."
+        )
+
+    bw = pyBigWig.open(str(out_path), "w")
+    try:
+        bw.addHeader(chrom_sizes)
+        if not ordered_df.empty:
+            bw.addEntries(
+                ordered_df["chrom"].tolist(),
+                ordered_df["start"].astype(int).tolist(),
+                ends=ordered_df["end"].astype(int).tolist(),
+                values=ordered_df["beta"].astype(float).tolist(),
+            )
+    finally:
+        bw.close()
+    return out_path
+
+
+def export_methylation_bigwig(
+    sample_id: str,
+    track: str,
+    out_path: Path,
+) -> Path:
+    beta_df, genome = _load_prep_beta_track(sample_id, track)
+    chrom_sizes = _load_chrom_sizes(genome)
+    return _write_bigwig(beta_df, out_path, chrom_sizes)
+
 ## Region Comparison Results Helpers
 
 COMPARISON_RESULTS_DIR = RESULTS_DIR / "01_region_calling_analysis" / "comparison"
@@ -378,13 +619,13 @@ def _load_aggregate_comparison_csv(filename: str) -> pd.DataFrame:
 
     return pd.concat(frames, ignore_index=True)
 
-def load_pmds(sample_id: str, tool: str) -> pd.DataFrame:
-    tool_config = _get_tool_config(tool)
+def load_tool_regions(sample_id: str, tool: str) -> pd.DataFrame:
+    tool_config = _get_tool_config(_canonical_tool_name(tool))
     path_parts = [part.format(sample=sample_id) for part in tool_config["path_parts"]]
     pmd_file = RESULTS_DIR / "01_region_calling_analysis" / Path(*path_parts)
     if not pmd_file.exists():
         raise FileNotFoundError(
-            f"PMD file not found for sample_id={sample_id!r} and tool={tool!r}: {pmd_file}"
+            f"Region file not found for sample_id={sample_id!r} and tool={tool!r}: {pmd_file}"
         )
 
     df = pd.read_csv(
@@ -398,12 +639,17 @@ def load_pmds(sample_id: str, tool: str) -> pd.DataFrame:
     missing_cols = [col for col in ["chrom", "start", "end"] if col not in df.columns]
     if missing_cols:
         raise ValueError(
-            f"PMD file for tool={tool!r} is missing expected coordinate columns {missing_cols}: {pmd_file}"
+            f"Region file for tool={tool!r} is missing expected coordinate columns {missing_cols}: {pmd_file}"
         )
 
     df = _standardize_region_df(df)
     return df[["chrom", "start", "end"]]
-    
+
+
+def load_pmds(sample_id: str, tool: str) -> pd.DataFrame:
+    return load_tool_regions(sample_id, tool)
+
+
 def get_run_stats_df():
     return _load_aggregate_comparison_csv("all_run_stats.csv")
 
@@ -413,19 +659,106 @@ def get_region_stats_df():
 def get_region_context_df():
     return _load_aggregate_comparison_csv("all_region_context_stats.csv")
 
-def load_jaccard_matrix(sample_id: str, region_type: str) -> pd.DataFrame:
-    region_type = str(region_type).upper()
-    if region_type not in {"PMD", "PMR"}:
-        raise ValueError(
-            f"region_type must be one of {{'PMD', 'PMR'}}, got {region_type!r}."
+def _load_comparison_matrix(
+    sample_id: str,
+    filename: str,
+) -> pd.DataFrame:
+    matrix_path = COMPARISON_RESULTS_DIR / sample_id / filename
+    if not matrix_path.exists():
+        raise FileNotFoundError(
+            f"Comparison matrix not found for sample_id={sample_id!r}: {matrix_path}"
         )
 
-    expected_path = COMPARISON_RESULTS_DIR / sample_id / "jaccard_matrix.csv"
-    raise NotImplementedError(
-        "Saved Jaccard matrix loading is not currently supported because no "
-        "jaccard matrix artifacts are present in the comparison outputs. "
-        f"Expected artifact for sample_id={sample_id!r}, region_type={region_type!r}: {expected_path}"
+    matrix_df = pd.read_csv(matrix_path, index_col=0)
+    matrix_df.index = matrix_df.index.astype(str)
+    matrix_df.columns = matrix_df.columns.astype(str)
+    matrix_df = matrix_df.apply(pd.to_numeric, errors="coerce")
+    return matrix_df
+
+
+def load_jaccard_matrix(sample_id: str) -> pd.DataFrame:
+    return _load_comparison_matrix(sample_id, "jaccard_matrix.csv")
+
+
+def load_pct_cover_matrix(sample_id: str) -> pd.DataFrame:
+    return _load_comparison_matrix(sample_id, "pct_cover_matrix.csv")
+
+
+def export_region_bed(
+    sample_id: str,
+    tool: str,
+    out_path: Path,
+) -> Path:
+    tool_slug = normalize_tool_slug(tool)
+    genome = _get_sample_genome(sample_id)
+    chrom_sizes = _load_chrom_sizes(genome)
+    regions_df = load_tool_regions(sample_id, tool_slug)
+    regions_df = _sort_intervals_by_chrom_order(regions_df, "chrom", "start", chrom_sizes)
+    bed_df = regions_df.copy()
+    bed_df["name"] = f"{tool_slug}_{region_type_for_tool(tool_slug)}"
+    bed_df["score"] = 0
+    bed_df["strand"] = "."
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bed_df[["chrom", "start", "end", "name", "score", "strand"]].to_csv(
+        out_path,
+        sep="\t",
+        header=False,
+        index=False,
     )
+    return out_path
+
+
+def export_sample_igv_tracks(
+    sample_id: str,
+    export_root: Path,
+    *,
+    export_wgbs_bigwig: bool = True,
+    export_hm450k_bigwig: bool = True,
+    export_region_beds: bool = True,
+    region_tools: list[str] | None = None,
+) -> dict[str, object]:
+    export_root = Path(export_root)
+    sample_root = export_root / sample_id
+    methylation_paths: list[Path] = []
+    region_paths: list[Path] = []
+
+    if export_wgbs_bigwig:
+        methylation_paths.append(
+            export_methylation_bigwig(
+                sample_id,
+                "wgbs",
+                sample_root / "methylation" / "wgbs.beta.bw",
+            )
+        )
+    if export_hm450k_bigwig:
+        methylation_paths.append(
+            export_methylation_bigwig(
+                sample_id,
+                "hm450k",
+                sample_root / "methylation" / "hm450k.beta.bw",
+            )
+        )
+    if export_region_beds:
+        for tool_slug in region_tools or igv_export_tool_slugs():
+            normalized_tool = normalize_tool_slug(tool_slug)
+            region_paths.append(
+                export_region_bed(
+                    sample_id,
+                    normalized_tool,
+                    sample_root
+                    / "regions"
+                    / f"{normalized_tool}.{region_type_for_tool(normalized_tool)}.bed",
+                )
+            )
+
+    return {
+        "sample_id": sample_id,
+        "genome": _get_sample_genome(sample_id),
+        "methylation_paths": methylation_paths,
+        "region_paths": region_paths,
+    }
 
 
 ## Synthetic Results Helpers
@@ -789,3 +1122,119 @@ def get_false_positive_beta_df() -> pd.DataFrame:
 
 def get_per_tool_summary_df() -> pd.DataFrame:
     return _read_synthetic_metrics_table("per_tool_summary.tsv")
+
+
+## LAD Results Helpers
+
+LAD_RESULTS_DIR = RESULTS_DIR / "04_lad_analysis"
+LAD_TABLES_DIR = LAD_RESULTS_DIR / "tables"
+LAD_FIGURE_OUTPUT_DIR = RESULTS_DIR / "figures" / "05_lad"
+LAD_TOOL_ORDER = [
+    "methylseg",
+    "methylseg_hm450k",
+    "methylseekr",
+    "dnmtools",
+    "dnmtools_array",
+    "dnmtools_pmr",
+    "mmseekr",
+    "methyl_lasso",
+]
+LAD_TOOL_LABELS = {
+    "methylseg": "MethylSeg WGBS",
+    "methylseg_hm450k": "MethylSeg HM450K",
+    "methylseekr": "MethylSeekR",
+    "dnmtools": "DNMTools",
+    "dnmtools_array": "DNMTools Array",
+    "dnmtools_pmr": "DNMTools PMR",
+    "mmseekr": "MMSeekR",
+    "methyl_lasso": "MethylLasso",
+}
+LAD_TOOL_COLORS = {
+    "methylseg": "#0b5394",
+    "methylseg_hm450k": "#3d85c6",
+    "methylseekr": "#9aa0a6",
+    "dnmtools": "#9aa0a6",
+    "dnmtools_array": "#9aa0a6",
+    "dnmtools_pmr": "#9aa0a6",
+    "mmseekr": "#9aa0a6",
+    "methyl_lasso": "#9aa0a6",
+}
+LAD_METRIC_LABELS = {
+    "pct_regions_overlapping_lads": "Fraction of regions overlapping LADs",
+    "pct_regions_overlapping_lads_gte_150kb": "Fraction of regions overlapping LADs by at least 150 kb",
+    "avg_distance_to_nearest_lad": "Average distance to nearest LAD (bp)",
+    "avg_distance_to_nearest_lad_boundary": "Average distance to nearest LAD boundary (bp)",
+    "avg_distance_to_nearest_lad_boundary_non_overlapping": "Average distance to nearest LAD boundary for non-overlapping regions (bp)",
+    "pct_regions_with_boundary_within_150kb_of_lad_boundary": "Fraction of regions with a boundary within 150 kb of a LAD boundary",
+    "pct_non_overlapping_regions_within_150kb_of_lad_boundary": "Fraction of non-overlapping regions with a boundary within 150 kb of a LAD boundary",
+    "pct_regions_sharing_lad": "Fraction of LAD-overlapping regions sharing a LAD",
+    "pmd_coverage_by_lads": "Fraction of region bases covered by LADs",
+    "pct_lads_overlapping": "Fraction of LADs overlapping regions",
+    "lad_coverage_by_pmds": "Fraction of LAD bases covered by regions",
+}
+
+
+def _read_lad_table(filename: str) -> pd.DataFrame:
+    table_path = LAD_TABLES_DIR / filename
+    if not table_path.exists():
+        raise FileNotFoundError(f"LAD results table not found: {table_path}")
+    return pd.read_csv(table_path, sep="\t")
+
+
+def apply_lad_tool_order(df: pd.DataFrame, tool_col: str = "tool") -> pd.DataFrame:
+    out_df = df.copy()
+    out_df[tool_col] = pd.Categorical(
+        out_df[tool_col].astype(str),
+        categories=LAD_TOOL_ORDER,
+        ordered=True,
+    )
+    out_df = out_df.dropna(subset=[tool_col]).sort_values(tool_col).reset_index(drop=True)
+    return out_df
+
+
+def add_lad_tool_labels(df: pd.DataFrame, tool_col: str = "tool") -> pd.DataFrame:
+    out_df = df.copy()
+    out_df["tool_label"] = out_df[tool_col].astype(str).map(LAD_TOOL_LABELS)
+    out_df["tool_label"] = pd.Categorical(
+        out_df["tool_label"],
+        categories=[LAD_TOOL_LABELS[tool] for tool in LAD_TOOL_ORDER],
+        ordered=True,
+    )
+    return out_df
+
+
+def lad_label_palette(tool_order: list[str] | None = None) -> dict[str, str]:
+    ordered_tools = tool_order or LAD_TOOL_ORDER
+    return {LAD_TOOL_LABELS[tool]: LAD_TOOL_COLORS[tool] for tool in ordered_tools}
+
+
+def get_lad_association_metrics_df() -> pd.DataFrame:
+    return _read_lad_table("lad_association_metrics.tsv")
+
+
+def get_lad_combined_summary_df() -> pd.DataFrame:
+    return _read_lad_table("lad_combined_summary.tsv")
+
+
+def get_lad_null_summary_df() -> pd.DataFrame:
+    return _read_lad_table("lad_null_summary.tsv")
+
+
+def get_lad_unique_lad_exports_df() -> pd.DataFrame:
+    return _read_lad_table("lad_unique_lad_exports.tsv")
+
+
+def get_lad_profile_outputs_df() -> pd.DataFrame:
+    return _read_lad_table("lad_profile_outputs.tsv")
+
+
+def get_lad_unique_lad_summary_df() -> pd.DataFrame:
+    return _read_lad_table("lad_unique_lad_summary.tsv")
+
+
+def get_lad_sample_genomes_df() -> pd.DataFrame:
+    return _read_lad_table("lad_sample_genomes.tsv")
+
+
+def get_lad_reference_summary_df() -> pd.DataFrame:
+    return _read_lad_table("lad_reference_summary.tsv")

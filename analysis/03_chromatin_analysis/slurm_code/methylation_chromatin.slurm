@@ -17,7 +17,7 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 OUT_ROOT="${CHROMATIN_OUT_ROOT:-$REPO_ROOT/results/03_chromatin_analysis}"
 SEGMENTATION_RESULTS_PATH="${SEGMENTATION_RESULTS_PATH:-$REPO_ROOT/results/01_region_calling_analysis}"
 CHROMATIN_DATA_DIR="${CHROMATIN_DATA_DIR:-$REPO_ROOT/data/chromatin_data}"
-PIPELINE="${CHROMATIN_PIPELINE_SCRIPT:-$SCRIPT_DIR/run_chromatin.py}"
+PIPELINE="${CHROMATIN_PIPELINE_SCRIPT:-$REPO_ROOT/analysis/03_chromatin_analysis/run_chromatin.py}"
 
 mkdir -p "$OUT_ROOT/logs"
 cd "$OUT_ROOT"

@@ -10,6 +10,7 @@ CHROMATIN_DATA_DIR="$REPO_ROOT/data/chromatin_data"
 SKIP_DEEPTOOLS=0
 INCLUDE_HEATMAPS=0
 DEEPTOOLS_TOOLS=""
+DEPENDENT_JOB_ID=""
 
 CONDA_ROOT=/uufs/chpc.utah.edu/common/home/clementm-group1/conda/mambaforge
 CONDA_PYTHON=$CONDA_ROOT/envs/jt_wgbs_analysis/bin/python
@@ -29,11 +30,13 @@ Defaults:
   --chromatin-data-dir        \$REPO_ROOT/data/chromatin_data
 
 Options:
+  --dependent_job_id <slurm_job_id>
   --skip-deeptools
   --include-heatmaps
   --deeptools-tools "methylseg methylseg_hm450k methylseekr dnmtools dnmtools_array dnmtools_pmr mmseekr methyl_lasso"
 
 If --deeptools-tools is omitted, the default is to render profiles for all tools.
+If --dependent_job_id is provided, region-output preflight checks are deferred to the runtime job.
 EOF
 }
 
@@ -49,6 +52,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --chromatin-data-dir)
       CHROMATIN_DATA_DIR=$2
+      shift 2
+      ;;
+    --dependent_job_id)
+      DEPENDENT_JOB_ID=$2
       shift 2
       ;;
     --skip-deeptools)
@@ -74,6 +81,11 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -n "${DEPENDENT_JOB_ID}" ] && [ -z "${DEPENDENT_JOB_ID// }" ]; then
+  echo "The --dependent_job_id value must not be empty." >&2
+  exit 1
+fi
 
 OUT_ROOT=$("$CONDA_PYTHON" - "$OUT_ROOT" <<'PY'
 import sys
@@ -107,12 +119,13 @@ for run_dir in cleaned_regions tables figures deeptools logs; do
 done
 mkdir -p "$OUT_ROOT/logs"
 
-"$CONDA_PYTHON" - "$SEGMENTATION_RESULTS_PATH" "$CHROMATIN_DATA_DIR" <<'PY'
+"$CONDA_PYTHON" - "$SEGMENTATION_RESULTS_PATH" "$CHROMATIN_DATA_DIR" "$DEPENDENT_JOB_ID" <<'PY'
 import sys
 from pathlib import Path
 
 segmentation_root = Path(sys.argv[1])
 chromatin_dir = Path(sys.argv[2])
+dependent_job_id = sys.argv[3].strip()
 samples = ["ESO26.wgbs", "TE5.wgbs"]
 tool_paths = {
     "methylseg": ["methylseg", "{sample}", "out", "wgbs", "summary_files", "segments_cleaned_PMD.bed"],
@@ -128,10 +141,11 @@ tool_paths = {
 missing = []
 for sample in samples:
     sample_id = sample.replace(".wgbs", "")
-    for suffix in [".h3k36me2.bw", ".h3k36me2.broadPeak.gz"]:
-        path = chromatin_dir / f"{sample_id}{suffix}"
-        if not path.exists():
-            missing.append(f"{sample}: missing chromatin file {path}")
+    bw_path = chromatin_dir / f"{sample_id}.h3k36me2.bw"
+    if not bw_path.exists():
+        missing.append(f"{sample}: missing chromatin file {bw_path}")
+    if dependent_job_id:
+        continue
     for tool_name, parts in tool_paths.items():
         path = segmentation_root
         for part in parts:
@@ -145,10 +159,16 @@ if missing:
     )
 PY
 
+dependency_args=()
+if [ -n "$DEPENDENT_JOB_ID" ]; then
+  dependency_args+=(--dependency="afterok:${DEPENDENT_JOB_ID}")
+fi
+
 job_id=$(sbatch --parsable \
   --chdir="$OUT_ROOT" \
   --job-name="chromatin_${ts}" \
-  --export=ALL,CHROMATIN_OUT_ROOT="$OUT_ROOT",SEGMENTATION_RESULTS_PATH="$SEGMENTATION_RESULTS_PATH",CHROMATIN_DATA_DIR="$CHROMATIN_DATA_DIR",CHROMATIN_SLURM_CODE_DIR="$SCRIPT_DIR",CHROMATIN_PIPELINE_SCRIPT="$SCRIPT_DIR/run_chromatin.py",SKIP_DEEPTOOLS="$SKIP_DEEPTOOLS",INCLUDE_HEATMAPS="$INCLUDE_HEATMAPS",DEEPTOOLS_TOOLS="$DEEPTOOLS_TOOLS" \
+  "${dependency_args[@]}" \
+  --export=ALL,CHROMATIN_OUT_ROOT="$OUT_ROOT",SEGMENTATION_RESULTS_PATH="$SEGMENTATION_RESULTS_PATH",CHROMATIN_DATA_DIR="$CHROMATIN_DATA_DIR",CHROMATIN_SLURM_CODE_DIR="$SCRIPT_DIR",CHROMATIN_PIPELINE_SCRIPT="$REPO_ROOT/analysis/03_chromatin_analysis/run_chromatin.py",SKIP_DEEPTOOLS="$SKIP_DEEPTOOLS",INCLUDE_HEATMAPS="$INCLUDE_HEATMAPS",DEEPTOOLS_TOOLS="$DEEPTOOLS_TOOLS" \
   "$SCRIPT_DIR/methylation_chromatin.slurm")
 
 echo "Output root: $OUT_ROOT"
@@ -156,6 +176,9 @@ echo "Segmentation results: $SEGMENTATION_RESULTS_PATH"
 echo "Chromatin data dir: $CHROMATIN_DATA_DIR"
 echo "Skip deepTools: $SKIP_DEEPTOOLS"
 echo "Include heatmaps: $INCLUDE_HEATMAPS"
+if [ -n "$DEPENDENT_JOB_ID" ]; then
+  echo "Dependent job id: $DEPENDENT_JOB_ID"
+fi
 if [ -n "$DEEPTOOLS_TOOLS" ]; then
   echo "deepTools tools: $DEEPTOOLS_TOOLS"
 fi

@@ -1136,7 +1136,15 @@ def prepare_tcga_lad_reference(
 ) -> dict:
     if str(LAD_SLURM_DIR) not in sys.path:
         sys.path.append(str(LAD_SLURM_DIR))
-    from run_lad import prepare_lad_reference
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    target_path = LAD_SLURM_DIR / "01_run_lad.py"
+    spec = spec_from_file_location("methylseg_lad_runner", target_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load LAD runner from {target_path}")
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    prepare_lad_reference = module.prepare_lad_reference
 
     out_dir = ensure_dir(out_dir)
     if not force_reference_rebuild:

@@ -4,7 +4,7 @@ import sys
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-TARGET_PATH = PROJECT_ROOT / "analysis" / "04_lad_analysis" / "run_lad.py"
+TARGET_PATH = PROJECT_ROOT / "analysis" / "04_lad_analysis" / "01_run_lad.py"
 
 
 def _load_target_module():

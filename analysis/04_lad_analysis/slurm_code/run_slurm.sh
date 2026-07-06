@@ -155,16 +155,24 @@ for import_path in (repo_root, analysis_root):
     if import_str not in sys.path:
         sys.path.insert(0, import_str)
 
-from run_lad import (
-    DEFAULT_HG19_TO_HG38_CHAIN,
-    DEFAULT_LAD_INTERVAL_TRACK_PATH,
-    DEFAULT_LAMINB1_SIGNAL_TRACK_PATH,
-    DEFAULT_LIFTOVER_SCRIPT_PATH,
-    DEFAULT_SELECTED_SAMPLES,
-    REQUIRED_TOOLS,
-    TOOL_CONFIG_BY_NAME,
-)
+from importlib.util import module_from_spec, spec_from_file_location
+
+target_path = analysis_root / "01_run_lad.py"
+spec = spec_from_file_location("methylseg_lad_runner", target_path)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"Could not load LAD runner from {target_path}")
+module = module_from_spec(spec)
+spec.loader.exec_module(module)
+
 from lad_analysis_utils import build_tool_region_path
+
+DEFAULT_HG19_TO_HG38_CHAIN = module.DEFAULT_HG19_TO_HG38_CHAIN
+DEFAULT_LAD_INTERVAL_TRACK_PATH = module.DEFAULT_LAD_INTERVAL_TRACK_PATH
+DEFAULT_LAMINB1_SIGNAL_TRACK_PATH = module.DEFAULT_LAMINB1_SIGNAL_TRACK_PATH
+DEFAULT_LIFTOVER_SCRIPT_PATH = module.DEFAULT_LIFTOVER_SCRIPT_PATH
+DEFAULT_SELECTED_SAMPLES = module.DEFAULT_SELECTED_SAMPLES
+REQUIRED_TOOLS = module.REQUIRED_TOOLS
+TOOL_CONFIG_BY_NAME = module.TOOL_CONFIG_BY_NAME
 
 samples = selected_samples or list(DEFAULT_SELECTED_SAMPLES)
 missing = []
@@ -197,7 +205,7 @@ fi
 job_id=$(sbatch --parsable \
   --chdir="$OUT_ROOT" \
   --job-name="lad_${ts}" \
-  --export=ALL,LAD_OUT_ROOT="$OUT_ROOT",SEGMENTATION_RESULTS_PATH="$SEGMENTATION_RESULTS_PATH",LAD_SLURM_CODE_DIR="$SCRIPT_DIR",LAD_PIPELINE_SCRIPT="$SCRIPT_DIR/run_lad.py",LAD_SAMPLES="$LAD_SAMPLES",RUN_DEEPTOOLS="$RUN_DEEPTOOLS",INCLUDE_HEATMAPS="$INCLUDE_HEATMAPS",FORCE_REFERENCE_REBUILD="$FORCE_REFERENCE_REBUILD",FORCE_DEEPTOOLS="$FORCE_DEEPTOOLS",PRIMARY_WINDOW_BP="$PRIMARY_WINDOW_BP",PROFILE_BIN_BP="$PROFILE_BIN_BP",PROFILE_REGION_BODY_BP="$PROFILE_REGION_BODY_BP" \
+  --export=ALL,LAD_OUT_ROOT="$OUT_ROOT",SEGMENTATION_RESULTS_PATH="$SEGMENTATION_RESULTS_PATH",LAD_SLURM_CODE_DIR="$SCRIPT_DIR",LAD_PIPELINE_SCRIPT="$SCRIPT_DIR/01_run_lad.py",LAD_SAMPLES="$LAD_SAMPLES",RUN_DEEPTOOLS="$RUN_DEEPTOOLS",INCLUDE_HEATMAPS="$INCLUDE_HEATMAPS",FORCE_REFERENCE_REBUILD="$FORCE_REFERENCE_REBUILD",FORCE_DEEPTOOLS="$FORCE_DEEPTOOLS",PRIMARY_WINDOW_BP="$PRIMARY_WINDOW_BP",PROFILE_BIN_BP="$PROFILE_BIN_BP",PROFILE_REGION_BODY_BP="$PROFILE_REGION_BODY_BP" \
   "$SCRIPT_DIR/methylation_lad.slurm")
 
 echo "Output root: $OUT_ROOT"
@@ -205,7 +213,7 @@ echo "Segmentation results: $SEGMENTATION_RESULTS_PATH"
 if [ "${#SAMPLES[@]}" -gt 0 ]; then
   echo "Samples: ${SAMPLES[*]}"
 else
-  echo "Samples: default run_lad.py sample set"
+  echo "Samples: default 01_run_lad.py sample set"
 fi
 echo "Run deepTools: $RUN_DEEPTOOLS"
 echo "Include heatmaps: $INCLUDE_HEATMAPS"

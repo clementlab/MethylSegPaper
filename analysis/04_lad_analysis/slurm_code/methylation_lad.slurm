@@ -16,7 +16,7 @@ SCRIPT_DIR="${LAD_SLURM_CODE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 REPO_ROOT="${REPO_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 OUT_ROOT="${LAD_OUT_ROOT:-$REPO_ROOT/results/04_lad_analysis}"
 SEGMENTATION_RESULTS_PATH="${SEGMENTATION_RESULTS_PATH:-$REPO_ROOT/results/01_region_calling_analysis}"
-PIPELINE="${LAD_PIPELINE_SCRIPT:-$SCRIPT_DIR/run_lad.py}"
+PIPELINE="${LAD_PIPELINE_SCRIPT:-$SCRIPT_DIR/01_run_lad.py}"
 
 mkdir -p "$OUT_ROOT/logs"
 cd "$OUT_ROOT"
