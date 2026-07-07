@@ -51,7 +51,12 @@ Most workflows are written so that:
 
 - code lives in the repo,
 - large intermediate files land under `results/`,
-- notebooks and scripts can share the same output tree.
+- notebooks and scripts can share the same analysis output tree.
+
+Figure exports belong under `figures/out/`, not under `results/`. Figure
+notebooks should write publication assets into subdirectories of
+`figures/out/`, while analysis workflows keep writing data products into
+`results/`.
 
 ## Main workflow entrypoints
 
@@ -116,7 +121,5 @@ mirror the numbered workflow areas in `analysis/`.
 
 For workflow debugging and development, several analysis folders also contain
 test or exploratory notebooks alongside the Python entrypoints.
-
-TODO: move figure outputs out of results folder and into figures/out
 
 Fix bug in methylseg 450k where it will call a region over the centromere with almost no data

@@ -7,9 +7,11 @@ import subprocess
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import pyBigWig
 import seaborn as sns
 import yaml
+from plotly.subplots import make_subplots
 
 
 DATA_DIR = Path(
@@ -23,6 +25,10 @@ CANONICAL_CHROMS = frozenset(
 )
 RESULTS_DIR = Path("/uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/results")
 OUT_DIR = Path("/uufs/chpc.utah.edu/common/home/u0914269/clement/projects/20260624_methylseg/figures/out")
+METHYL_SEG_FIGURE_OUTPUT_DIR = OUT_DIR / "methyl_seg_figures"
+REGION_CALLING_FIGURE_OUTPUT_DIR = OUT_DIR / "region_calling_figures"
+SYNTHETIC_FIGURE_OUTPUT_DIR = OUT_DIR / "03_synthetic_figures"
+CHROMATIN_FIGURE_OUTPUT_DIR = OUT_DIR / "chromatin_figures"
 REFERENCE_DATA_DIR = DATA_DIR / "reference_data"
 METHYLSEG_RESULTS_DIR = RESULTS_DIR / "01_region_calling_analysis" / "methylseg"
 TOOL_REGISTRY = [
@@ -660,6 +666,197 @@ def get_region_stats_df():
 def get_region_context_df():
     return _load_aggregate_comparison_csv("all_region_context_stats.csv")
 
+
+REGION_CALLING_TOOL_ORDER = [
+    "methylseg_wgbs",
+    "methylseg_hm450k",
+    "methylseekr",
+    "dnmtools",
+    "dnmtools_array",
+    "dnmtools_pmr",
+    "mmseekr",
+    "methylasso",
+]
+REGION_CALLING_TOOL_LABELS = {
+    "methylseg_wgbs": "MethylSeg WGBS",
+    "methylseg_hm450k": "MethylSeg HM450K",
+    "methylseekr": "MethylSeekR",
+    "dnmtools": "DNMTools",
+    "dnmtools_array": "DNMTools Array",
+    "dnmtools_pmr": "DNMTools PMR",
+    "mmseekr": "MMSeekR",
+    "methylasso": "MethylLasso",
+}
+REGION_CALLING_POINT_COLORS = {
+    "MethylSeg WGBS": "#0b5394",
+    "MethylSeg HM450K": "#3d85c6",
+    "MethylSeekR": "#9aa0a6",
+    "DNMTools": "#9aa0a6",
+    "DNMTools Array": "#9aa0a6",
+    "DNMTools PMR": "#9aa0a6",
+    "MMSeekR": "#9aa0a6",
+    "MethylLasso": "#9aa0a6",
+}
+
+
+def _ordered_region_calling_tool_labels() -> list[str]:
+    return [REGION_CALLING_TOOL_LABELS[tool] for tool in REGION_CALLING_TOOL_ORDER]
+
+
+def _style_region_calling_axis(
+    ax: plt.Axes,
+    title: str,
+    ylabel: str,
+    *,
+    title_size: int = 18,
+    label_size: int = 14,
+    tick_size: int = 11,
+    x_label_rotation: int = 70,
+) -> None:
+    ax.set_title(title, fontsize=title_size)
+    ax.set_xlabel("")
+    ax.set_ylabel(ylabel, fontsize=label_size)
+    ax.tick_params(axis="x", labelsize=tick_size)
+    ax.tick_params(axis="y", labelsize=tick_size)
+    for label in ax.get_xticklabels():
+        label.set_rotation(x_label_rotation)
+        label.set_ha("right")
+        label.set_rotation_mode("anchor")
+
+
+def plot_summary_table(
+    table_df: pd.DataFrame,
+    title: str,
+    *,
+    table_font_size: int = 12,
+    row_height: int = 40,
+    header_height: int = 44,
+    min_height: int = 700,
+) -> go.Figure:
+    display_df = table_df.copy()
+    for column in table_df.columns:
+        if pd.api.types.is_numeric_dtype(table_df[column]):
+            display_df[column] = table_df[column].map(
+                lambda value: "" if pd.isna(value) else f"{float(value):,.2f}"
+            )
+    display_df = display_df.astype(object)
+    if "Tool" in display_df.columns:
+        methylseg_mask = display_df["Tool"].astype(str).str.startswith("MethylSeg")
+        if methylseg_mask.any():
+            display_df.loc[methylseg_mask, :] = display_df.loc[methylseg_mask, :].astype(str).apply(
+                lambda col: col.map(lambda value: f"<b>{value}</b>")
+            )
+
+    fig = go.Figure(
+        data=[
+            go.Table(
+                header=dict(
+                    values=[f"<b>{col}</b>" for col in display_df.columns],
+                    fill_color="#d9d9d9",
+                    align="left",
+                    font=dict(size=table_font_size),
+                    height=header_height,
+                ),
+                cells=dict(
+                    values=[display_df[col].tolist() for col in display_df.columns],
+                    fill_color="white",
+                    align="left",
+                    font=dict(size=table_font_size),
+                    height=row_height,
+                ),
+            )
+        ]
+    )
+    fig.update_layout(
+        title=title,
+        margin=dict(l=20, r=20, t=70, b=30),
+        height=max(min_height, header_height + row_height * len(display_df)),
+    )
+    return fig
+
+
+def draw_boxplot(
+    ax: plt.Axes,
+    data: pd.DataFrame,
+    y: str,
+    title: str,
+    ylabel: str,
+    *,
+    box_fill_color: str = "#d9d9d9",
+    box_width: float = 0.6,
+) -> None:
+    sns.boxplot(
+        data=data,
+        x="tool_label",
+        y=y,
+        order=_ordered_region_calling_tool_labels(),
+        color=box_fill_color,
+        width=box_width,
+        fliersize=0,
+        linewidth=1.2,
+        ax=ax,
+    )
+    _style_region_calling_axis(ax, title, ylabel)
+
+
+def draw_violin_with_points(
+    ax: plt.Axes,
+    data: pd.DataFrame,
+    y: str,
+    title: str,
+    ylabel: str,
+    *,
+    violin_fill_color: str = "#d9d9d9",
+    violin_width: float = 0.95,
+    point_size: int = 18,
+    point_alpha: float = 0.65,
+    point_jitter: float = 0.12,
+    point_offset: float = 0.18,
+) -> None:
+    ordered_labels = _ordered_region_calling_tool_labels()
+    rng = np.random.default_rng(0)
+
+    for position, tool_label in enumerate(ordered_labels):
+        values = pd.to_numeric(
+            data.loc[data["tool_label"] == tool_label, y],
+            errors="coerce",
+        ).dropna()
+        if values.empty:
+            continue
+
+        violin = ax.violinplot(
+            values.to_numpy(),
+            positions=[position],
+            widths=violin_width,
+            showmeans=False,
+            showextrema=False,
+            showmedians=False,
+        )
+        body = violin["bodies"][0]
+        body.set_facecolor(violin_fill_color)
+        body.set_edgecolor("#5f5f5f")
+        body.set_alpha(0.8)
+        body.set_linewidth(1.0)
+        verts = body.get_paths()[0].vertices
+        verts[:, 0] = np.minimum(verts[:, 0], position)
+
+        x_values = position + point_offset + rng.uniform(
+            -point_jitter, point_jitter, size=len(values)
+        )
+        ax.scatter(
+            x_values,
+            values.to_numpy(),
+            s=point_size,
+            color=REGION_CALLING_POINT_COLORS[tool_label],
+            alpha=point_alpha,
+            linewidths=0,
+        )
+
+    ax.set_xticks(range(len(ordered_labels)))
+    ax.set_xticklabels(ordered_labels)
+    _style_region_calling_axis(ax, title, ylabel)
+
+
 def _load_comparison_matrix(
     sample_id: str,
     filename: str,
@@ -800,10 +997,36 @@ SYNTHETIC_TOOL_COLORS = {
     "mmseekr": "#6c757d",
     "methyl_lasso": "#3f8f97",
 }
+SYNTHETIC_BAR_HIGHLIGHT_COLORS = {
+    "methylseg": "#0b5394",
+    "methylseg_hm450k": "#3d85c6",
+    "methylseekr": "#9aa0a6",
+    "dnmtools": "#9aa0a6",
+    "dnmtools_array": "#9aa0a6",
+    "dnmtools_pmr": "#9aa0a6",
+    "mmseekr": "#9aa0a6",
+    "methyl_lasso": "#9aa0a6",
+}
 
 SYNTHETIC_TOOL_RANK = {
     tool: rank for rank, tool in enumerate(SYNTHETIC_TOOL_ORDER)
 }
+
+SYNTHETIC_EXAMPLE_TRACK_COLORS = {
+    "source": "#577590",
+    "cleaned": "#43aa8b",
+    "injected": "#f3722c",
+}
+SYNTHETIC_EXAMPLE_TRACK_TITLES = {
+    "source": "Original source",
+    "cleaned": "Cleaned background",
+    "injected": "Injected synthetic",
+}
+SYNTHETIC_EXAMPLE_INTERVAL_STYLES = {
+    "background": {"fillcolor": "#90be6d", "opacity": 0.16},
+    "injected": {"fillcolor": "#f94144", "opacity": 0.18},
+}
+SYNTHETIC_READ_CHUNK_SIZE = 1_000_000
 
 LOWER_IS_BETTER_PATTERNS = (
     "_mabe",
@@ -979,7 +1202,7 @@ def plot_synthetic_metric_bar(
 
     bar_positions = np.arange(len(plot_df))
     bar_colors = [
-        SYNTHETIC_TOOL_COLORS[tool_name]
+        SYNTHETIC_BAR_HIGHLIGHT_COLORS[tool_name]
         for tool_name in plot_df[tool_col].astype(str).tolist()
     ]
     ax.bar(
@@ -1125,11 +1348,593 @@ def get_per_tool_summary_df() -> pd.DataFrame:
     return _read_synthetic_metrics_table("per_tool_summary.tsv")
 
 
+def _normalize_chrom_name(chrom: str) -> str:
+    chrom = str(chrom)
+    return "chr" + chrom.replace("chr", "", 1)
+
+
+def _synthetic_manifest_path(run_root: str | Path) -> Path:
+    run_root = Path(run_root).resolve()
+    manifest_path = run_root if run_root.is_file() else run_root / "synthetic_sample_manifest.tsv"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Synthetic manifest not found: {manifest_path}")
+    return manifest_path
+
+
+def _synthetic_manifest_base_dir(manifest_path: str | Path) -> Path:
+    manifest_path = Path(manifest_path).resolve()
+    return manifest_path.parent.parent.parent
+
+
+def _resolve_synthetic_manifest_entry(
+    path_like: str | Path,
+    manifest_path: str | Path,
+) -> Path:
+    path = Path(path_like)
+    if path.is_absolute():
+        return path
+    return (_synthetic_manifest_base_dir(manifest_path) / path).resolve()
+
+
+def _load_synthetic_manifest_row(
+    manifest_path: str | Path,
+    sample_id: str,
+    *,
+    id_col: str = "synthetic_sample_id",
+) -> pd.Series:
+    manifest_df = pd.read_csv(_synthetic_manifest_path(manifest_path), sep="\t")
+    matches = manifest_df.loc[manifest_df[id_col].astype(str) == str(sample_id)].copy()
+    if matches.empty:
+        raise ValueError(
+            f"Sample {sample_id!r} was not found in manifest {_synthetic_manifest_path(manifest_path)}."
+        )
+    return matches.iloc[0]
+
+
+def list_synthetic_background_samples(background_root: str | Path) -> list[str]:
+    manifest_df = pd.read_csv(_synthetic_manifest_path(background_root), sep="\t")
+    return manifest_df["synthetic_sample_id"].astype(str).sort_values().tolist()
+
+
+def _read_table_for_chrom(
+    path: str | Path,
+    *,
+    chrom: str,
+    chrom_col: str,
+    read_csv_kwargs: dict,
+) -> pd.DataFrame:
+    chrom = _normalize_chrom_name(chrom)
+    frames = []
+    seen_target = False
+    for chunk in pd.read_csv(path, chunksize=SYNTHETIC_READ_CHUNK_SIZE, **read_csv_kwargs):
+        chunk = chunk.copy()
+        chunk_chrom = "chr" + chunk[chrom_col].astype(str).str.removeprefix("chr")
+        mask = chunk_chrom == chrom
+        filtered = chunk.loc[mask].copy()
+        if not filtered.empty:
+            seen_target = True
+            frames.append(filtered)
+        elif seen_target:
+            break
+    if not frames:
+        names = read_csv_kwargs.get("names")
+        return pd.DataFrame(columns=names if names is not None else None)
+    return pd.concat(frames, ignore_index=True)
+
+
+def _standardize_wgbs_track_df(df: pd.DataFrame) -> pd.DataFrame:
+    out_df = df.copy()
+    out_df["chrom"] = out_df["chrom"].astype(str)
+    out_df["chrom"] = "chr" + out_df["chrom"].str.replace("^chr", "", regex=True)
+    for col in ["start", "end", "meth", "coverage"]:
+        out_df[col] = pd.to_numeric(out_df[col], errors="coerce")
+    out_df = out_df[out_df["chrom"].isin(CANONICAL_CHROMS)].copy()
+    out_df = out_df.dropna(subset=["chrom", "start", "end", "meth", "coverage"])
+    out_df["start"] = out_df["start"].astype(np.int64)
+    out_df["end"] = out_df["end"].astype(np.int64)
+    out_df["meth"] = out_df["meth"].round().astype(np.int64)
+    out_df["coverage"] = out_df["coverage"].round().astype(np.int64)
+    out_df = out_df.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+    return out_df[["chrom", "start", "end", "meth", "coverage"]]
+
+
+def _wgbs_track_to_beta_track(df: pd.DataFrame) -> pd.DataFrame:
+    beta_df = df[["chrom", "start", "end"]].copy()
+    beta_df["beta"] = df["meth"] / df["coverage"].replace(0, np.nan)
+    beta_df["beta"] = beta_df["beta"].fillna(0.0)
+    return _standardize_beta_track_df(beta_df)
+
+
+def _load_synthetic_wgbs_track_for_chrom(
+    path: str | Path,
+    chrom: str,
+) -> pd.DataFrame:
+    df = _read_table_for_chrom(
+        path,
+        chrom=chrom,
+        chrom_col="chrom",
+        read_csv_kwargs={
+            "sep": "\t",
+            "header": None,
+            "names": ["chrom", "start", "end", "meth", "coverage"],
+        },
+    )
+    if df.empty:
+        raise ValueError(f"No rows for {chrom!r} were found in {path}.")
+    return _standardize_wgbs_track_df(df)
+
+
+def _coverage_track_to_beta_track(
+    df: pd.DataFrame,
+    *,
+    chrom_col: str,
+    start_col: str,
+    end_col: str,
+) -> pd.DataFrame:
+    beta_df = pd.DataFrame(
+        {
+            "chrom": df[chrom_col],
+            "start": df[start_col],
+            "end": df[end_col],
+            "beta": df["methylated_reads"] / df["coverage"].replace(0, np.nan),
+        }
+    )
+    beta_df["beta"] = beta_df["beta"].fillna(0.0)
+    return _standardize_beta_track_df(beta_df)
+
+
+def _load_source_beta_track_for_chrom(
+    *,
+    source_file: str | Path,
+    source_kind: str,
+    source_genome: str,
+    chrom: str,
+) -> pd.DataFrame:
+    source_path = Path(source_file)
+    chrom = _normalize_chrom_name(chrom)
+
+    if source_kind == "beta" or source_path.suffix == ".beta":
+        df = _load_beta_sample(source_path, source_genome)
+        df = df.loc[
+            df["CpG_chrm"].astype(str).map(_normalize_chrom_name) == chrom
+        ].copy()
+        if df.empty:
+            raise ValueError(f"No rows for {chrom!r} were found in {source_path}.")
+        return _coverage_track_to_beta_track(
+            df,
+            chrom_col="CpG_chrm",
+            start_col="CpG_start",
+            end_col="CpG_end",
+        )
+
+    if source_kind != "wgbs_bed_gz" and source_path.suffixes[-2:] != [".bed", ".gz"]:
+        raise ValueError(
+            f"Unsupported source kind {source_kind!r} for synthetic example track: {source_path}"
+        )
+
+    preview = pd.read_csv(
+        source_path,
+        sep="\t",
+        header=None,
+        nrows=1,
+        compression="gzip",
+    )
+    n_cols = preview.shape[1]
+
+    if n_cols == 5:
+        df = _read_table_for_chrom(
+            source_path,
+            chrom=chrom,
+            chrom_col="CpG_chrm",
+            read_csv_kwargs={
+                "sep": "\t",
+                "header": None,
+                "compression": "gzip",
+                "names": [
+                    "CpG_chrm",
+                    "CpG_beg",
+                    "CpG_end",
+                    "coverage",
+                    "meth_percent",
+                ],
+            },
+        )
+        if df.empty:
+            raise ValueError(f"No rows for {chrom!r} were found in {source_path}.")
+        df["methylated_reads"] = (
+            pd.to_numeric(df["meth_percent"], errors="coerce")
+            / 100.0
+            * pd.to_numeric(df["coverage"], errors="coerce")
+        )
+        df = _standardize_coord_df(
+            df,
+            required_cols=[
+                "CpG_chrm",
+                "CpG_beg",
+                "CpG_end",
+                "methylated_reads",
+                "coverage",
+            ],
+            numeric_cols=["methylated_reads", "coverage"],
+        )
+        df["methylated_reads"] = df["methylated_reads"].round().astype(np.int64)
+        df["coverage"] = df["coverage"].round().astype(np.int64)
+        return _coverage_track_to_beta_track(
+            df,
+            chrom_col="CpG_chrm",
+            start_col="CpG_beg",
+            end_col="CpG_end",
+        )
+
+    if n_cols == 6:
+        df = _read_table_for_chrom(
+            source_path,
+            chrom=chrom,
+            chrom_col="CpG_chrm",
+            read_csv_kwargs={
+                "sep": "\t",
+                "header": None,
+                "compression": "gzip",
+                "names": [
+                    "CpG_chrm",
+                    "CpG_beg",
+                    "CpG_end",
+                    "beta",
+                    "coverage",
+                    "context",
+                ],
+            },
+        )
+        if df.empty:
+            raise ValueError(f"No rows for {chrom!r} were found in {source_path}.")
+        df["methylated_reads"] = (
+            pd.to_numeric(df["beta"], errors="coerce")
+            * pd.to_numeric(df["coverage"], errors="coerce")
+        )
+        df = _standardize_coord_df(
+            df,
+            required_cols=[
+                "CpG_chrm",
+                "CpG_beg",
+                "CpG_end",
+                "methylated_reads",
+                "coverage",
+            ],
+            numeric_cols=["methylated_reads", "coverage"],
+        )
+        df["methylated_reads"] = df["methylated_reads"].round().astype(np.int64)
+        df["coverage"] = df["coverage"].round().astype(np.int64)
+        return _coverage_track_to_beta_track(
+            df,
+            chrom_col="CpG_chrm",
+            start_col="CpG_beg",
+            end_col="CpG_end",
+        )
+
+    raise ValueError(f"Unsupported source format with {n_cols} columns in {source_path}.")
+
+
+def _load_truth_intervals_for_chrom(
+    path: str | Path,
+    chrom: str,
+) -> pd.DataFrame:
+    chrom = _normalize_chrom_name(chrom)
+    preview = pd.read_csv(path, sep="\t", header=None, nrows=1)
+    usecols = [0, 1, 2, 3] if preview.shape[1] >= 4 else [0, 1, 2]
+    names = ["chrom", "start", "end", "label"][: len(usecols)]
+    df = _read_table_for_chrom(
+        path,
+        chrom=chrom,
+        chrom_col="chrom",
+        read_csv_kwargs={
+            "sep": "\t",
+            "header": None,
+            "usecols": usecols,
+            "names": names,
+        },
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["chrom", "start", "end", "label"])
+
+    df = df.copy()
+    df["chrom"] = "chr" + df["chrom"].astype(str).str.replace("^chr", "", regex=True)
+    df["start"] = pd.to_numeric(df["start"], errors="coerce")
+    df["end"] = pd.to_numeric(df["end"], errors="coerce")
+    if "label" not in df.columns:
+        df["label"] = ""
+    df["label"] = df["label"].fillna("").astype(str)
+    df = df[df["chrom"].isin(CANONICAL_CHROMS)].copy()
+    df = df.dropna(subset=["chrom", "start", "end"])
+    df["start"] = df["start"].astype(np.int64)
+    df["end"] = df["end"].astype(np.int64)
+    df = df[df["end"] > df["start"]].copy()
+    return df.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+
+
+def _bin_beta_track_df(beta_df: pd.DataFrame, *, chrom: str, bin_bp: int) -> pd.DataFrame:
+    chrom = _normalize_chrom_name(chrom)
+    bin_bp = int(bin_bp)
+    if bin_bp <= 0:
+        raise ValueError(f"bin_bp must be positive, got {bin_bp}.")
+
+    chrom_df = beta_df.loc[beta_df["chrom"] == chrom].copy()
+    if chrom_df.empty:
+        raise ValueError(f"No beta-track rows remain for {chrom!r}.")
+
+    chrom_df["bin_start"] = (chrom_df["start"] // bin_bp) * bin_bp
+    binned_df = (
+        chrom_df.groupby("bin_start", as_index=False, sort=True, observed=True)
+        .agg(mean_beta=("beta", "mean"), n_cpg=("beta", "size"))
+        .reset_index(drop=True)
+    )
+    binned_df["bin_end"] = binned_df["bin_start"] + bin_bp
+    binned_df["bin_midpoint"] = binned_df["bin_start"] + (bin_bp / 2.0)
+    binned_df["chrom"] = chrom
+    return binned_df[
+        ["chrom", "bin_start", "bin_end", "bin_midpoint", "mean_beta", "n_cpg"]
+    ]
+
+
+def _validate_chr_track_alignment(
+    cleaned_track_df: pd.DataFrame,
+    injected_track_df: pd.DataFrame,
+    *,
+    chrom: str,
+) -> None:
+    if len(cleaned_track_df) != len(injected_track_df):
+        raise ValueError(
+            f"Cleaned and injected tracks have different row counts on {chrom}: "
+            f"{len(cleaned_track_df)} != {len(injected_track_df)}."
+        )
+
+    cleaned_coords = cleaned_track_df[["chrom", "start", "end", "coverage"]]
+    injected_coords = injected_track_df[["chrom", "start", "end", "coverage"]]
+    if not cleaned_coords.equals(injected_coords):
+        raise ValueError(
+            f"Cleaned and injected tracks are not coordinate-aligned on {chrom}."
+        )
+
+
+def _interval_overlay_shapes(
+    intervals_df: pd.DataFrame,
+    *,
+    row: int,
+    fillcolor: str,
+    opacity: float,
+) -> list[dict]:
+    if intervals_df.empty:
+        return []
+
+    xref = "x" if row == 1 else f"x{row}"
+    yref = "y domain" if row == 1 else f"y{row} domain"
+    return [
+        {
+            "type": "rect",
+            "xref": xref,
+            "yref": yref,
+            "x0": int(interval.start),
+            "x1": int(interval.end),
+            "y0": 0,
+            "y1": 1,
+            "fillcolor": fillcolor,
+            "opacity": opacity,
+            "line": {"width": 0},
+            "layer": "below",
+        }
+        for interval in intervals_df.itertuples(index=False)
+    ]
+
+
+def _coordinate_aligned_plot_tracks(track_dfs: dict[str, pd.DataFrame]) -> bool:
+    track_items = list(track_dfs.items())
+    if len(track_items) < 2:
+        return True
+
+    _, reference_df = track_items[0]
+    reference_coords = reference_df[["chrom", "start", "end"]]
+    for _, track_df in track_items[1:]:
+        if len(track_df) != len(reference_df):
+            return False
+        if not reference_coords.equals(track_df[["chrom", "start", "end"]]):
+            return False
+    return True
+
+
+def _compute_plot_keep_idx(
+    n_points: int,
+    *,
+    max_points: int | None,
+    seed: int = 42,
+) -> tuple[np.ndarray, bool]:
+    if max_points is None or int(max_points) <= 0 or n_points <= int(max_points):
+        return np.arange(n_points), False
+
+    rng = np.random.default_rng(seed)
+    keep_idx = np.sort(rng.choice(n_points, size=int(max_points), replace=False))
+    return keep_idx, True
+
+
+def plot_synthetic_background_example(
+    *,
+    background_root: str | Path,
+    injected_root: str | Path,
+    sample_id: str,
+    injected_sample_id: str | None = None,
+    chrom: str = "chr1",
+    max_points: int | None = 120_000,
+    point_size: float = 2.0,
+    point_opacity: float = 0.55,
+) -> go.Figure:
+    chrom = _normalize_chrom_name(chrom)
+    background_manifest = _synthetic_manifest_path(background_root)
+    injected_manifest = _synthetic_manifest_path(injected_root)
+
+    background_row = _load_synthetic_manifest_row(background_manifest, sample_id)
+    injected_sample_id = injected_sample_id or f"{sample_id}_injected_pmds"
+    injected_row = _load_synthetic_manifest_row(injected_manifest, injected_sample_id)
+
+    background_sample_id = str(injected_row.get("background_sample_id", sample_id))
+    if background_sample_id != str(sample_id):
+        raise ValueError(
+            f"Injected sample {injected_sample_id!r} belongs to {background_sample_id!r}, "
+            f"not {sample_id!r}."
+        )
+
+    source_beta_df = _load_source_beta_track_for_chrom(
+        source_file=background_row["source_file"],
+        source_kind=str(background_row.get("source_kind", "")),
+        source_genome=str(background_row.get("source_genome", "hg38")),
+        chrom=chrom,
+    )
+    cleaned_track_df = _load_synthetic_wgbs_track_for_chrom(
+        _resolve_synthetic_manifest_entry(
+            background_row["normalized_source_file"],
+            background_manifest,
+        ),
+        chrom,
+    )
+    injected_track_df = _load_synthetic_wgbs_track_for_chrom(
+        _resolve_synthetic_manifest_entry(
+            injected_row["synthetic_file"],
+            injected_manifest,
+        ),
+        chrom,
+    )
+    _validate_chr_track_alignment(cleaned_track_df, injected_track_df, chrom=chrom)
+
+    cleaned_beta_df = _wgbs_track_to_beta_track(cleaned_track_df)
+    injected_beta_df = _wgbs_track_to_beta_track(injected_track_df)
+    background_truth_df = _load_truth_intervals_for_chrom(
+        _resolve_synthetic_manifest_entry(background_row["truth_bed"], background_manifest),
+        chrom,
+    )
+    injected_truth_df = _load_truth_intervals_for_chrom(
+        _resolve_synthetic_manifest_entry(injected_row["truth_bed"], injected_manifest),
+        chrom,
+    )
+
+    raw_tracks = {
+        "source": source_beta_df.copy(),
+        "cleaned": cleaned_beta_df.copy(),
+        "injected": injected_beta_df.copy(),
+    }
+    shared_keep_idx = None
+    downsampled = False
+    if _coordinate_aligned_plot_tracks(raw_tracks):
+        shared_keep_idx, downsampled = _compute_plot_keep_idx(
+            len(next(iter(raw_tracks.values()))),
+            max_points=max_points,
+        )
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=[
+            SYNTHETIC_EXAMPLE_TRACK_TITLES["source"],
+            SYNTHETIC_EXAMPLE_TRACK_TITLES["cleaned"],
+            SYNTHETIC_EXAMPLE_TRACK_TITLES["injected"],
+        ],
+    )
+
+    for row_idx, track_name in enumerate(["source", "cleaned", "injected"], start=1):
+        plot_df = raw_tracks[track_name].copy()
+        if shared_keep_idx is not None:
+            keep_idx = shared_keep_idx
+            track_downsampled = downsampled
+        else:
+            keep_idx, track_downsampled = _compute_plot_keep_idx(
+                len(plot_df),
+                max_points=max_points,
+            )
+            downsampled = downsampled or track_downsampled
+        plot_df = plot_df.iloc[keep_idx].reset_index(drop=True)
+        plot_df["point_midpoint"] = (
+            plot_df["start"].to_numpy(dtype=np.float64)
+            + plot_df["end"].to_numpy(dtype=np.float64)
+        ) / 2.0
+        fig.add_trace(
+            go.Scattergl(
+                x=plot_df["point_midpoint"],
+                y=plot_df["beta"],
+                mode="markers",
+                marker={
+                    "color": SYNTHETIC_EXAMPLE_TRACK_COLORS[track_name],
+                    "size": point_size,
+                    "opacity": point_opacity,
+                },
+                customdata=np.column_stack(
+                    [
+                        plot_df["start"].to_numpy(dtype=np.int64),
+                        plot_df["end"].to_numpy(dtype=np.int64),
+                    ]
+                ),
+                hovertemplate=(
+                    "CpG: %{customdata[0]:,}-%{customdata[1]:,}<br>"
+                    "Beta: %{y:.3f}<extra></extra>"
+                ),
+                showlegend=False,
+                name=SYNTHETIC_EXAMPLE_TRACK_TITLES[track_name],
+            ),
+            row=row_idx,
+            col=1,
+        )
+
+    overlay_shapes = []
+    overlay_shapes.extend(
+        _interval_overlay_shapes(
+            background_truth_df,
+            row=1,
+            **SYNTHETIC_EXAMPLE_INTERVAL_STYLES["background"],
+        )
+    )
+    overlay_shapes.extend(
+        _interval_overlay_shapes(
+            injected_truth_df,
+            row=3,
+            **SYNTHETIC_EXAMPLE_INTERVAL_STYLES["injected"],
+        )
+    )
+
+    for row_idx in range(1, 4):
+        fig.update_yaxes(
+            range=[0.0, 1.0],
+            fixedrange=True,
+            title_text="Mean beta",
+            row=row_idx,
+            col=1,
+        )
+
+    x_min = min(int(df["start"].min()) for df in raw_tracks.values())
+    x_max = max(int(df["end"].max()) for df in raw_tracks.values())
+    fig.update_xaxes(title_text="Genomic position", row=3, col=1)
+    fig.update_xaxes(
+        range=[x_min, x_max],
+        rangeslider={"visible": True},
+        showgrid=True,
+        row=3,
+        col=1,
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=850,
+        hovermode="x unified",
+        shapes=overlay_shapes,
+        title=(
+            f"Synthetic background example: {sample_id} / {injected_sample_id} "
+            f"({chrom}, {'downsampled' if downsampled else 'full'})"
+        ),
+        margin={"l": 70, "r": 30, "t": 90, "b": 60},
+    )
+    return fig
+
+
 ## LAD Results Helpers
 
 LAD_RESULTS_DIR = RESULTS_DIR / "04_lad_analysis"
 LAD_TABLES_DIR = LAD_RESULTS_DIR / "tables"
-LAD_FIGURE_OUTPUT_DIR = RESULTS_DIR / "figures" / "05_lad"
+LAD_FIGURE_OUTPUT_DIR = OUT_DIR / "05_lad"
 LAD_TOOL_ORDER = [
     "methylseg",
     "methylseg_hm450k",
