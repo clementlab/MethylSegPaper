@@ -1,117 +1,57 @@
 from __future__ import annotations
 
 import json
-import os
-import random
-import re
-import sys
-from dataclasses import asdict, dataclass
+import multiprocessing as mp
 from pathlib import Path
 from typing import Iterable, Sequence
-
-import matplotlib
-
-matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from pandas.errors import EmptyDataError
+import seaborn as sns
+from scipy import stats
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
+    average_precision_score,
     balanced_accuracy_score,
-    confusion_matrix,
+    f1_score,
     matthews_corrcoef,
-    multilabel_confusion_matrix,
-    precision_recall_fscore_support,
+    roc_auc_score,
 )
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import RepeatedStratifiedKFold
+from tqdm.auto import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-TCGA_ANALYSIS_DIR = Path(__file__).resolve().parents[1]
-if str(TCGA_ANALYSIS_DIR) not in sys.path:
-    sys.path.insert(0, str(TCGA_ANALYSIS_DIR))
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from utils.tcga_segmentation_workflow import (  # noqa: E402
-    load_meth_ref,
-    load_tcga_sample_beta_dataframe,
-    load_tcga_samples_info,
-    run_segmentation_for_sample,
-)
 from repo_paths import REFERENCE_DATA_DIR, TCGA_CLASSIFICATION_RESULTS_DIR
 
-AUTOSOMES = [f"chr{i}" for i in range(1, 23)]
-COORD_COLS = ["CpG_chrm", "CpG_beg", "CpG_end"]
-METRIC_COLS = [
-    "mcc",
-    "balanced_accuracy",
-    "macro_f1",
-    "specificity",
-    "negative_precision",
-]
-BINARY_FEATURE_ORDER = ["PMD", "Random", "CGI", "Always cancer"]
-MULTICLASS_FEATURE_ORDER = ["PMD", "Random", "CGI", "Majority class", "Random class"]
-FEATURE_COLORS = {
-    "PMD": "#4C78A8",
-    "Random": "#A0A0A0",
-    "CGI": "#59A14F",
-    "Always cancer": "#E45756",
-    "Majority class": "#E45756",
-    "Random class": "#F28E2B",
+TCGA_SAMPLES = REFERENCE_DATA_DIR / "runAll.sh.samples"
+CGI_BED = REFERENCE_DATA_DIR / "cgi.bed"
+PMD_PATH = TCGA_CLASSIFICATION_RESULTS_DIR / "segmentation" / "methylseg"
+HG38_PATH = REFERENCE_DATA_DIR / "hg38.chrom.sizes"
+CENTROMERE_PATH = REFERENCE_DATA_DIR / "centromere.bed"
+GAP_PATH = REFERENCE_DATA_DIR / "gap.bed"
+METH_REF = REFERENCE_DATA_DIR / "parse450K.pl.order.lookup"
+RANDOM_SEED = 42
+MAX_SPLIT_WORKERS = 50
+_RANDOM_REGION_REFERENCE_CACHE = None
+_FEATURE_CLASSIFICATION_WORKER_STATE = {}
+CANNONICAL_CHROMOSOMES = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
+CLASSIFICATION_METRICS = ['balanced_accuracy', 'average_precision', 'macro_f1', 'mcc', 'roc_auc']
+FEATURE_SET_ORDER = ['PMD', 'Random PMD', 'CGI', 'Random long', 'Random short', 'Always cancer']
+FEATURE_SET_PALETTE = {
+    'PMD': '#0b5394',
+    'Random PMD': '#3d85c6',
+    'CGI': '#38761d',
+    'Random long': '#9c6ade',
+    'Random short': '#e69138',
+    'Always cancer': '#b7b7b7',
 }
-
-DEFAULT_GENOME_FILE = REFERENCE_DATA_DIR / "hg38.genome"
-DEFAULT_CGI_BED = REFERENCE_DATA_DIR / "cgi.bed"
-DEFAULT_SEGMENTATION_ROOT = TCGA_CLASSIFICATION_RESULTS_DIR / "segmentation"
-DEFAULT_OUT_DIR = TCGA_CLASSIFICATION_RESULTS_DIR / "ml_outputs"
-DEFAULT_N_VALUES = (1, 3, 5, 10, 50, 100, 500, 1000)
-
-
-@dataclass(frozen=True)
-class PipelineConfig:
-    out_dir: Path
-    segmentation_root: Path
-    case_sets: tuple[str, ...] = ("brca", "per_cancer", "pan_cancer", "multiclass")
-    n_values: tuple[int, ...] = ()
-    cv_splits: int = 5
-    n_estimators: int = 500
-    random_state: int = 42
-    cgi_bed: Path = DEFAULT_CGI_BED
-    genome_file: Path = DEFAULT_GENOME_FILE
-    max_samples_per_class: int | None = None
-    save_feature_matrices: bool = True
-    allow_missing_feature_sets: bool = False
-    call_missing_pmds: bool = True
-    high_confidence_pmd_min_fraction: float = 0.50
-    random_region_min_length_bp: int = 150_000
-    random_region_max_length_bp: int = 20_000_000
 
 
 def ensure_dir(path: str | Path) -> Path:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def safe_name(value: object) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
-
-
-def write_table(df: pd.DataFrame, path: str | Path, *, index: bool = False) -> Path:
-    path = Path(path)
-    ensure_dir(path.parent)
-    df.to_csv(path, sep="\t", index=index)
-    return path
-
-
-def concat_nonempty(frames: Iterable[pd.DataFrame | None]) -> pd.DataFrame:
-    usable_frames = [df for df in frames if df is not None and not df.empty]
-    if not usable_frames:
-        return pd.DataFrame()
-    return pd.concat(usable_frames, ignore_index=True)
 
 
 def write_json(data: dict, path: str | Path) -> Path:
@@ -121,2260 +61,2564 @@ def write_json(data: dict, path: str | Path) -> Path:
     return path
 
 
-def expected_feature_order(task_type: str) -> list[str]:
-    return BINARY_FEATURE_ORDER if task_type == "binary" else MULTICLASS_FEATURE_ORDER
+def write_table(df: pd.DataFrame, path: str | Path, *, index: bool = False) -> Path:
+    path = Path(path)
+    ensure_dir(path.parent)
+    df.to_csv(path, sep='	', index=index)
+    return path
 
 
-def add_feature_order(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "feature_set" not in df.columns:
-        return df
-    out = df.copy()
-    ranks = {}
-    for task_type in out.get("task_type", pd.Series(["binary"])).dropna().unique():
-        for idx, feature_set in enumerate(expected_feature_order(str(task_type))):
-            ranks[(str(task_type), feature_set)] = idx
-    out["_feature_order"] = out.apply(
-        lambda row: ranks.get(
-            (str(row.get("task_type", "binary")), row["feature_set"]), 999
-        ),
-        axis=1,
-    )
-    sort_cols = [
-        col
-        for col in [
-            "case_set",
-            "cohort_id",
-            "n_regions_requested",
-            "fold",
-            "_feature_order",
-            "feature_set",
-        ]
-        if col in out.columns
-    ]
-    out = (
-        out.sort_values(sort_cols)
-        .drop(columns=["_feature_order"])
-        .reset_index(drop=True)
-    )
-    return out
-
-
-def parse_n_values(value: str | Sequence[int] | None) -> tuple[int, ...]:
-    if value is None or value == "":
-        return DEFAULT_N_VALUES
+def parse_feature_counts(value: str | Sequence[int] | None) -> tuple[int, ...]:
+    if value is None:
+        return tuple()
     if isinstance(value, str):
-        pieces = [piece.strip() for piece in value.split(",") if piece.strip()]
+        pieces = [piece.strip() for piece in value.split(',') if piece.strip()]
         parsed = [int(piece) for piece in pieces]
     else:
         parsed = [int(piece) for piece in value]
-    parsed = sorted({n for n in parsed if n > 0})
+    parsed = sorted({count for count in parsed if int(count) > 0})
     if not parsed:
-        raise ValueError("At least one positive n value is required.")
+        raise ValueError('At least one positive feature count is required.')
     return tuple(parsed)
 
 
-def logspace_n_values(start: int = 1, stop: int = 1000, num: int = 20) -> list[int]:
-    values = np.rint(np.logspace(np.log10(start), np.log10(stop), num)).astype(int)
-    return sorted(set(int(v) for v in values if v > 0))
+def cohort_output_dir(out_root: str | Path, cohort_id: str, feature_count: int) -> Path:
+    return Path(out_root) / str(cohort_id) / f'n_features_{int(feature_count)}'
 
 
-def normalize_region_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["chr", "start", "end"])
-    out = df.copy()
-    rename = {"chrom": "chr", "CpG_chrm": "chr", "CpG_beg": "start", "CpG_end": "end"}
-    out = out.rename(columns={k: v for k, v in rename.items() if k in out.columns})
-    missing = {"chr", "start", "end"} - set(out.columns)
-    if missing:
-        raise ValueError(f"Region table is missing required columns: {sorted(missing)}")
-    out = out.copy()
-    out["chr"] = out["chr"].astype(str)
-    out["start"] = pd.to_numeric(out["start"], errors="coerce")
-    out["end"] = pd.to_numeric(out["end"], errors="coerce")
-    out = out.dropna(subset=["chr", "start", "end"]).copy()
-    out["start"] = out["start"].astype(np.int64)
-    out["end"] = out["end"].astype(np.int64)
-    out = out.loc[out["end"] > out["start"]].copy()
-    out["length"] = out["end"] - out["start"]
-    return out.sort_values(["chr", "start", "end"]).reset_index(drop=True)
-
-
-def make_region_ids(regions_df: pd.DataFrame, prefix: str) -> pd.DataFrame:
-    regions_df = normalize_region_df(regions_df)
-    regions_df = regions_df.reset_index(drop=True).copy()
-    regions_df["region_id"] = [
-        f"{prefix}_{i:06d}_{row.chr}_{int(row.start)}_{int(row.end)}"
-        for i, row in enumerate(regions_df.itertuples(index=False), start=1)
-    ]
-    return regions_df
-
-
-def read_genome_sizes(genome_file: str | Path) -> dict[str, int]:
-    genome_df = pd.read_csv(genome_file, sep="\t", header=None, usecols=[0, 1])
-    genome_df.columns = ["chr", "size"]
-    genome_df["chr"] = genome_df["chr"].astype(str)
-    genome_df["size"] = (
-        pd.to_numeric(genome_df["size"], errors="coerce").fillna(0).astype(int)
-    )
-    return dict(zip(genome_df["chr"], genome_df["size"]))
-
-
-def _merge_regions_with_metadata(
-    regions_df: pd.DataFrame,
-    metadata_cols: Sequence[str],
-) -> pd.DataFrame:
-    regions_df = normalize_region_df(regions_df)
-    if regions_df.empty:
-        return pd.DataFrame(columns=["chr", "start", "end", *metadata_cols, "length"])
-    merged_rows = []
-    for chrom, chrom_df in regions_df.sort_values(["chr", "start", "end"]).groupby(
-        "chr", sort=True
-    ):
-        current_start = None
-        current_end = None
-        metadata_values = {col: set() for col in metadata_cols}
-        for row in chrom_df.itertuples(index=False):
-            row_start = int(row.start)
-            row_end = int(row.end)
-            if current_start is None or row_start > current_end:
-                if current_start is not None:
-                    merged_rows.append(
-                        {
-                            "chr": chrom,
-                            "start": current_start,
-                            "end": current_end,
-                            **{
-                                col: ",".join(
-                                    sorted(str(v) for v in values if pd.notna(v))
-                                )
-                                for col, values in metadata_values.items()
-                            },
-                        }
-                    )
-                current_start = row_start
-                current_end = row_end
-                metadata_values = {col: set() for col in metadata_cols}
-            else:
-                current_end = max(current_end, row_end)
-            for col in metadata_cols:
-                value = getattr(row, col)
-                for piece in str(value).split(","):
-                    if piece and piece != "nan":
-                        metadata_values[col].add(piece)
-        if current_start is not None:
-            merged_rows.append(
-                {
-                    "chr": chrom,
-                    "start": current_start,
-                    "end": current_end,
-                    **{
-                        col: ",".join(sorted(str(v) for v in values if pd.notna(v)))
-                        for col, values in metadata_values.items()
-                    },
-                }
-            )
-    return normalize_region_df(pd.DataFrame(merged_rows))
-
-
-def _regions_with_any_overlap(
-    regions_df: pd.DataFrame, query_df: pd.DataFrame
-) -> pd.DataFrame:
-    regions = normalize_region_df(regions_df)
-    query = normalize_region_df(query_df)
-    if regions.empty or query.empty:
-        return regions.iloc[0:0].copy()
-    supported_rows = []
-    query_by_chrom = {
-        chrom: chrom_df.sort_values("start").reset_index(drop=True)
-        for chrom, chrom_df in query.groupby("chr", sort=False)
-    }
-    for row in regions.itertuples(index=False):
-        chrom_query = query_by_chrom.get(str(row.chr))
-        if chrom_query is None or chrom_query.empty:
-            continue
-        starts = chrom_query["start"].to_numpy()
-        ends = chrom_query["end"].to_numpy()
-        idx = np.searchsorted(starts, int(row.end), side="left")
-        if idx > 0 and np.any(ends[:idx] > int(row.start)):
-            supported_rows.append(row._asdict())
-    return normalize_region_df(pd.DataFrame(supported_rows))
-
-
-def eligible_tcga_samples(all_samples: pd.DataFrame | None = None) -> pd.DataFrame:
-    samples = load_tcga_samples_info() if all_samples is None else all_samples.copy()
-    out = samples.loc[
-        samples["sample_id"].astype(str).str.startswith("TCGA-")
-        & samples["project_id"].astype(str).str.startswith("TCGA-")
-        & samples["methylation_file"].notna()
-        & samples["sample_type"].isin(["Primary Tumor", "Solid Tissue Normal"])
-    ].copy()
-    out = out.drop_duplicates(subset=["sample_id"]).reset_index(drop=True)
-    out["sample_id"] = out["sample_id"].astype(str)
-    out["project_id"] = out["project_id"].astype(str)
-    out["sample_type"] = out["sample_type"].astype(str)
-    return out
-
-
-def summarize_tumor_projects(all_samples: pd.DataFrame, cv_splits: int) -> pd.DataFrame:
-    eligible = eligible_tcga_samples(all_samples)
-    summary = (
-        eligible.groupby(["project_id", "sample_type"]).size().unstack(fill_value=0)
-    )
-    for col in ["Primary Tumor", "Solid Tissue Normal"]:
-        if col not in summary.columns:
-            summary[col] = 0
-    summary = summary[["Primary Tumor", "Solid Tissue Normal"]].reset_index()
-    summary = summary.rename(
-        columns={"Primary Tumor": "n_tumors", "Solid Tissue Normal": "n_normals"}
-    )
-    summary["has_normal"] = summary["n_normals"] > 0
-    summary["binary_cv_feasible"] = (
-        summary["has_normal"]
-        & (summary["n_tumors"] >= cv_splits)
-        & (summary["n_normals"] >= cv_splits)
-    )
-    summary["multiclass_plus_normal_eligible"] = summary["has_normal"] & (
-        summary["n_tumors"] >= cv_splits
-    )
-    return summary.sort_values(
-        ["binary_cv_feasible", "n_normals", "n_tumors", "project_id"],
-        ascending=[False, False, False, True],
-    ).reset_index(drop=True)
-
-
-def build_labels(samples_df: pd.DataFrame, task_type: str) -> pd.Series:
-    samples = samples_df.set_index("sample_id", drop=False)
-    if task_type == "binary":
-        labels = np.where(
-            samples["sample_type"].astype(str).eq("Solid Tissue Normal"),
-            "Solid Tissue Normal",
-            "Cancer",
-        )
-    elif task_type == "multiclass":
-        labels = np.where(
-            samples["sample_type"].astype(str).eq("Solid Tissue Normal"),
-            "Normal",
-            samples["project_id"].astype(str),
-        )
-    else:
-        raise ValueError(f"Unknown task_type: {task_type}")
-    return pd.Series(labels, index=samples.index, name="label")
-
-
-def apply_sample_cap(
-    samples_df: pd.DataFrame,
-    task_type: str,
-    max_samples_per_class: int | None,
-    random_state: int,
-) -> pd.DataFrame:
-    if max_samples_per_class is None:
-        return samples_df.copy().reset_index(drop=True)
-    labels = build_labels(samples_df, task_type=task_type)
-    capped_parts = []
-    rng = np.random.default_rng(random_state)
-    for label in sorted(labels.unique()):
-        label_ids = labels.loc[labels.eq(label)].index.to_numpy()
-        if len(label_ids) > max_samples_per_class:
-            label_ids = rng.choice(label_ids, size=max_samples_per_class, replace=False)
-        capped_parts.append(samples_df.loc[samples_df["sample_id"].isin(label_ids)])
-    return pd.concat(capped_parts, ignore_index=True).drop_duplicates("sample_id")
-
-
-def build_case_cohorts(
-    all_samples: pd.DataFrame,
-    case_sets: Sequence[str],
-    cv_splits: int,
-    random_state: int,
-    max_samples_per_class: int | None = None,
-) -> tuple[list[dict], pd.DataFrame]:
-    eligible = eligible_tcga_samples(all_samples)
-    project_summary = summarize_tumor_projects(eligible, cv_splits=cv_splits)
-    cohorts: list[dict] = []
-
-    if "brca" in case_sets:
-        brca = eligible.loc[eligible["project_id"].eq("TCGA-BRCA")].copy()
-        brca = apply_sample_cap(brca, "binary", max_samples_per_class, random_state)
-        cohorts.append(
-            {
-                "case_set": "brca",
-                "cohort_id": "TCGA-BRCA",
-                "cohort_label": "TCGA-BRCA tumor vs normal",
-                "task_type": "binary",
-                "pmd_strategy": "cancer_specific",
-                "samples_df": brca,
-            }
-        )
-
-    if "per_cancer" in case_sets:
-        project_ids = project_summary.loc[
-            project_summary["binary_cv_feasible"], "project_id"
-        ].astype(str)
-        for project_id in project_ids:
-            cohort = eligible.loc[eligible["project_id"].eq(project_id)].copy()
-            cohort = apply_sample_cap(
-                cohort, "binary", max_samples_per_class, random_state
-            )
-            cohorts.append(
-                {
-                    "case_set": "per_cancer",
-                    "cohort_id": project_id,
-                    "cohort_label": f"{project_id} tumor vs normal",
-                    "task_type": "binary",
-                    "pmd_strategy": "cancer_specific",
-                    "samples_df": cohort,
-                }
-            )
-
-    if "pan_cancer" in case_sets:
-        pan = eligible.loc[
-            eligible["project_id"].isin(
-                project_summary.loc[project_summary["has_normal"], "project_id"]
-            )
-        ].copy()
-        pan = apply_sample_cap(pan, "binary", max_samples_per_class, random_state)
-        cohorts.append(
-            {
-                "case_set": "pan_cancer",
-                "cohort_id": "PAN_CANCER",
-                "cohort_label": "All cancers vs normal",
-                "task_type": "binary",
-                "pmd_strategy": "shared",
-                "samples_df": pan,
-            }
-        )
-
-    if "multiclass" in case_sets:
-        project_ids = project_summary.loc[
-            project_summary["multiclass_plus_normal_eligible"], "project_id"
-        ].astype(str)
-        multi = eligible.loc[eligible["project_id"].isin(project_ids)].copy()
-        multi = apply_sample_cap(
-            multi, "multiclass", max_samples_per_class, random_state
-        )
-        cohorts.append(
-            {
-                "case_set": "multiclass",
-                "cohort_id": "TUMOR_TYPES_PLUS_NORMAL",
-                "cohort_label": "Cancer multiclassification",
-                "task_type": "multiclass",
-                "pmd_strategy": "cancer_specific",
-                "samples_df": multi,
-            }
-        )
-
-    validated = []
-    warnings = []
-    for cohort in cohorts:
-        labels = build_labels(cohort["samples_df"], cohort["task_type"])
-        label_counts = labels.value_counts()
-        too_small = label_counts[label_counts < cv_splits]
-        if too_small.empty and label_counts.shape[0] >= 2:
-            validated.append(cohort)
-        else:
-            warnings.append(
-                {
-                    "case_set": cohort["case_set"],
-                    "cohort_id": cohort["cohort_id"],
-                    "warning": (
-                        f"Skipping cohort because labels cannot support {cv_splits}-fold "
-                        f"CV: {label_counts.to_dict()}"
-                    ),
-                }
-            )
-    warning_df = pd.DataFrame(warnings)
-    return validated, warning_df
-
-
-def prepare_probe_df(meth_ref_df: pd.DataFrame | None = None) -> pd.DataFrame:
-    meth_ref_df = load_meth_ref() if meth_ref_df is None else meth_ref_df.copy()
-    probe_df = meth_ref_df.loc[:, ["CpG_chrm", "CpG_beg", "CpG_end", "key"]].copy()
-    probe_df = probe_df.dropna(subset=["CpG_chrm", "CpG_beg", "CpG_end", "key"])
-    probe_df["CpG_chrm"] = probe_df["CpG_chrm"].astype(str)
-    if not probe_df["CpG_chrm"].str.startswith("chr").all():
-        probe_df["CpG_chrm"] = "chr" + probe_df["CpG_chrm"].str.replace(
-            "^chr", "", regex=True
-        )
-    probe_df["CpG_beg"] = pd.to_numeric(probe_df["CpG_beg"], errors="coerce")
-    probe_df["CpG_end"] = pd.to_numeric(probe_df["CpG_end"], errors="coerce")
-    probe_df = probe_df.dropna(subset=["CpG_beg", "CpG_end"]).copy()
-    probe_df["CpG_beg"] = probe_df["CpG_beg"].astype(np.int64)
-    probe_df["CpG_end"] = probe_df["CpG_end"].astype(np.int64)
-    probe_df = probe_df.loc[
-        probe_df["CpG_chrm"].isin(AUTOSOMES)
-        & (probe_df["CpG_end"] > probe_df["CpG_beg"])
-    ].copy()
-    return probe_df.sort_values(["CpG_chrm", "CpG_beg", "CpG_end", "key"]).reset_index(
-        drop=True
-    )
-
-
-def build_wide_methylation_table(
-    samples_df: pd.DataFrame,
-    meth_ref_df: pd.DataFrame | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    meth_ref_df = load_meth_ref() if meth_ref_df is None else meth_ref_df.copy()
-    coord_df = None
-    sample_series = {}
-    warnings = []
-    for row in samples_df.itertuples(index=False):
-        sample_id = str(row.sample_id)
-        try:
-            sample_df = load_tcga_sample_beta_dataframe(
-                sample_id,
-                row.methylation_file,
-                drop_nas=False,
-                meth_ref_df=meth_ref_df,
-            )
-        except Exception as exc:
-            warnings.append(
-                {
-                    "sample_id": sample_id,
-                    "warning": f"Failed to load methylation: {exc}",
-                }
-            )
-            continue
-        sample_df = sample_df.drop_duplicates(subset=["probe"]).set_index("probe")
-        if coord_df is None:
-            coord_df = sample_df.loc[:, COORD_COLS].copy()
-        sample_series[sample_id] = sample_df["beta"].rename(sample_id)
-    if coord_df is None or not sample_series:
-        raise ValueError("No methylation samples could be loaded.")
-    sample_beta_df = pd.concat(sample_series.values(), axis=1)
-    meth_data_df = pd.concat([coord_df, sample_beta_df], axis=1).reset_index(drop=True)
-    return meth_data_df, pd.DataFrame(warnings)
-
-
-def read_bed(path: str | Path, names: Sequence[str] | None = None) -> pd.DataFrame:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(path)
-    if path.stat().st_size == 0:
-        return pd.DataFrame(columns=["chr", "start", "end"])
-    try:
-        df = pd.read_csv(path, sep="\t", header=None, comment="#")
-    except EmptyDataError:
-        return pd.DataFrame(columns=["chr", "start", "end"])
-    if names is None:
-        names = ["chr", "start", "end"] + [
-            f"field_{i}" for i in range(4, df.shape[1] + 1)
-        ]
-    df = df.iloc[:, : len(names)].copy()
-    df.columns = list(names[: df.shape[1]])
-    return normalize_region_df(df)
-
-
-def resolve_pmd_summary_path(segmentation_root: str | Path, sample_id: str) -> Path:
-    summary_dir = (
-        Path(segmentation_root)
-        / "methylseg"
-        / str(sample_id)
-        / "out"
-        / "hm450k"
-        / "summary_files"
-    )
-    candidates = [
-        summary_dir / "segments_cleaned_PMD.bed",
-        summary_dir / "segments_PMD.bed",
-    ]
-    for path in candidates:
-        if path.exists():
-            return path
-    pmr_candidates = sorted(summary_dir.glob("*PMR*.bed"))
-    if pmr_candidates:
-        raise ValueError(
-            f"PMD file is missing for {sample_id}; refusing to use PMR file "
-            f"{pmr_candidates[0]}"
-        )
-    raise FileNotFoundError(f"No PMD BED file found for {sample_id} in {summary_dir}")
-
-
-def load_pmd_regions_for_samples(
-    sample_ids: Iterable[str], segmentation_root: str | Path
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    frames = []
-    warnings = []
-    for sample_id in sample_ids:
-        sample_id = str(sample_id)
-        try:
-            path = resolve_pmd_summary_path(segmentation_root, sample_id)
-            pmd_df = read_bed(path)
-        except Exception as exc:
-            warnings.append(
-                {"sample_id": sample_id, "warning": f"Could not load PMDs: {exc}"}
-            )
-            continue
-        if pmd_df.empty:
-            continue
-        pmd_df["sample_id"] = sample_id
-        frames.append(pmd_df)
-    if frames:
-        out = pd.concat(frames, ignore_index=True)
-        out = out.loc[out["chr"].isin(AUTOSOMES)].reset_index(drop=True)
-    else:
-        out = pd.DataFrame(columns=["chr", "start", "end", "length", "sample_id"])
-    return out, pd.DataFrame(warnings)
-
-
-def validate_pmd_preflight(
-    cohorts: Sequence[dict],
-    segmentation_root: str | Path,
-) -> pd.DataFrame:
-    rows = []
-    for cohort in cohorts:
-        tumor_samples = cohort["samples_df"].loc[
-            cohort["samples_df"]["sample_type"].eq("Primary Tumor")
-        ]
-        for sample_id in tumor_samples["sample_id"].astype(str):
-            row = {
-                "case_set": cohort["case_set"],
-                "cohort_id": cohort["cohort_id"],
-                "cohort_label": cohort["cohort_label"],
-                "task_type": cohort["task_type"],
-                "feature_set": "PMD",
-                "fold": np.nan,
-                "n_regions_requested": np.nan,
-                "sample_id": sample_id,
-                "status": "available",
-                "n_regions_selected": np.nan,
-                "failure_reason": "",
-            }
-            try:
-                row["pmd_path"] = str(
-                    resolve_pmd_summary_path(segmentation_root, sample_id)
-                )
-            except Exception as exc:
-                row["status"] = "missing"
-                row["failure_reason"] = str(exc)
-                row["pmd_path"] = ""
-            rows.append(row)
-
-    status_df = pd.DataFrame(rows)
-    return status_df
-
-
-def _pmd_candidate_samples(cohorts: Sequence[dict]) -> pd.DataFrame:
-    frames = []
-    for cohort in cohorts:
-        samples = cohort["samples_df"].copy()
-        samples = samples.loc[samples["sample_type"].eq("Primary Tumor")].copy()
-        if samples.empty:
-            continue
-        samples["case_set"] = cohort["case_set"]
-        samples["cohort_id"] = cohort["cohort_id"]
-        samples["cohort_label"] = cohort["cohort_label"]
-        samples["task_type"] = cohort["task_type"]
-        frames.append(samples)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True).drop_duplicates("sample_id")
-
-
-def ensure_missing_pmds(
-    cohorts: Sequence[dict],
-    segmentation_root: str | Path,
-    *,
-    call_missing_pmds: bool,
-    genome: str = "hg38",
-) -> pd.DataFrame:
-    candidates = _pmd_candidate_samples(cohorts)
-    rows = []
-    for row in candidates.itertuples(index=False):
-        sample_id = str(row.sample_id)
-        status_row = {
-            "case_set": row.case_set,
-            "cohort_id": row.cohort_id,
-            "cohort_label": row.cohort_label,
-            "task_type": row.task_type,
-            "sample_id": sample_id,
-            "methylation_file": str(row.methylation_file),
-            "status": "existing",
-            "pmd_path": "",
-            "message": "",
-        }
-        try:
-            status_row["pmd_path"] = str(
-                resolve_pmd_summary_path(segmentation_root, sample_id)
-            )
-            rows.append(status_row)
-            continue
-        except Exception as missing_exc:
-            if not call_missing_pmds:
-                status_row["status"] = "missing"
-                status_row["message"] = str(missing_exc)
-                rows.append(status_row)
-                continue
-
-        try:
-            result = run_segmentation_for_sample(
-                sample_id=sample_id,
-                meth_file=row.methylation_file,
-                genome=genome,
-                segmentation_root=segmentation_root,
-                force_recreate=False,
-                print_logs=True,
-                run_on_dnmtools_array=False,
-                clean_individual_chr_outputs=True,
-            )
-            pmd_path = resolve_pmd_summary_path(segmentation_root, sample_id)
-            status_row["status"] = "generated"
-            status_row["pmd_path"] = str(pmd_path)
-            status_row["message"] = (
-                f"Generated PMD file via MethylSeg: {result.methylseg_hm450k_bed}"
-            )
-        except Exception as exc:
-            status_row["status"] = "generation_failed"
-            status_row["message"] = str(exc)
-        rows.append(status_row)
-    return pd.DataFrame(rows)
-
-
-def merge_pmds_with_support(pmd_df: pd.DataFrame) -> pd.DataFrame:
-    pmd_df = normalize_region_df(pmd_df)
-    if pmd_df.empty:
-        return pd.DataFrame(
-            columns=["chr", "start", "end", "sample_ids", "n_samples", "length"]
-        )
-    if "sample_id" not in pmd_df.columns:
-        raise ValueError("PMD table must include sample_id for support ranking.")
-    pmd_df = pmd_df.rename(columns={"sample_id": "sample_ids"})
-    merged = _merge_regions_with_metadata(pmd_df, ["sample_ids"])
-    merged["n_samples"] = merged["sample_ids"].str.split(",").apply(len)
-    return merged
-
-
-def add_support_fraction(
-    pmd_support_df: pd.DataFrame, n_training_tumor_samples: int
-) -> pd.DataFrame:
-    if n_training_tumor_samples <= 0:
-        raise ValueError("n_training_tumor_samples must be positive.")
-    out = pmd_support_df.copy()
-    if out.empty:
-        out["support_fraction"] = pd.Series(dtype=float)
-        return out
-    out["support_fraction"] = out["n_samples"].astype(float) / float(
-        n_training_tumor_samples
-    )
-    return out
-
-
-def prepare_fold_pmd_tables(
-    train_tumor_samples_df: pd.DataFrame,
-    segmentation_root: str | Path,
-    genome_file: str | Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    all_pmds, warnings = load_pmd_regions_for_samples(
-        train_tumor_samples_df["sample_id"].astype(str), segmentation_root
-    )
-    if all_pmds.empty:
-        empty = pd.DataFrame(
-            columns=[
-                "chr",
-                "start",
-                "end",
-                "sample_ids",
-                "n_samples",
-                "length",
-                "support_fraction",
-            ]
-        )
-        return all_pmds, empty, warnings
-
-    all_merged = merge_pmds_with_support(all_pmds)
-    all_merged = add_support_fraction(all_merged, len(train_tumor_samples_df))
-    return all_pmds, all_merged, warnings
-
-
-def select_pmd_regions(
-    train_tumor_samples_df: pd.DataFrame,
-    segmentation_root: str | Path,
-    genome_file: str | Path,
-    n_regions: int,
-    strategy: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    all_pmds, all_merged, warnings = prepare_fold_pmd_tables(
-        train_tumor_samples_df, segmentation_root, genome_file
-    )
-    selected, all_merged, selection_warnings = select_pmd_regions_from_fold_tables(
-        train_tumor_samples_df,
-        all_pmds,
-        all_merged,
-        genome_file,
-        n_regions,
-        strategy,
-    )
-    return selected, all_merged, concat_nonempty([warnings, selection_warnings])
-
-
-def select_pmd_regions_from_fold_tables(
-    train_tumor_samples_df: pd.DataFrame,
-    all_pmds: pd.DataFrame,
-    all_merged: pd.DataFrame,
-    genome_file: str | Path,
-    n_regions: int,
-    strategy: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if all_pmds.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    all_merged = all_merged.loc[
-        (all_merged["length"] >= 1000) & (all_merged["length"] <= 100000000)
-    ].copy()
-    if all_merged.empty:
-        return pd.DataFrame(), all_merged, pd.DataFrame()
-
-    if strategy == "shared":
-        selected = all_merged.sort_values(
-            ["n_samples", "length"], ascending=[False, False]
-        ).head(n_regions)
-    elif strategy == "cancer_specific":
-        selected_parts = []
-        for project_id, project_samples in train_tumor_samples_df.groupby(
-            "project_id", sort=True
-        ):
-            project_pmds = all_pmds.loc[
-                all_pmds["sample_id"].isin(project_samples["sample_id"].astype(str))
-            ].copy()
-            merged = merge_pmds_with_support(project_pmds)
-            merged = merged.loc[
-                (merged["length"] >= 1000) & (merged["length"] <= 100000000)
-            ].copy()
-            merged = merged.sort_values(
-                ["n_samples", "length"], ascending=[False, False]
-            ).head(n_regions)
-            if not merged.empty:
-                merged["source_project_id"] = str(project_id)
-                selected_parts.append(merged)
-        selected = (
-            pd.concat(selected_parts, ignore_index=True)
-            if selected_parts
-            else pd.DataFrame(columns=all_merged.columns)
-        )
-        if not selected.empty:
-            selected = _merge_regions_with_metadata(
-                selected.loc[
-                    :, ["chr", "start", "end", "source_project_id", "sample_ids"]
-                ],
-                ["source_project_id", "sample_ids"],
-            )
-            selected["n_samples"] = (
-                selected["sample_ids"]
-                .astype(str)
-                .str.split(",")
-                .apply(lambda values: len(set(values)))
-            )
-    else:
-        raise ValueError(f"Unknown PMD strategy: {strategy}")
-
-    selected = make_region_ids(selected.head(max(n_regions, len(selected))), "pmd")
-    selected["feature_set"] = "PMD"
-    return selected, all_merged, pd.DataFrame()
-
-
-def probe_supported_regions(
-    regions_df: pd.DataFrame, probe_df: pd.DataFrame
-) -> pd.DataFrame:
-    regions = normalize_region_df(regions_df)
-    if regions.empty:
-        return regions
-    probe = probe_df.rename(
-        columns={"CpG_chrm": "chr", "CpG_beg": "start", "CpG_end": "end"}
-    ).loc[:, ["chr", "start", "end"]]
-    return _regions_with_any_overlap(regions, probe)
-
-
-def build_non_pmd_regions(
-    pmd_union_df: pd.DataFrame, probe_df: pd.DataFrame, genome_file: str | Path
-) -> pd.DataFrame:
-    pmd_union_df = _merge_regions_with_metadata(normalize_region_df(pmd_union_df), [])
-    genome_sizes = read_genome_sizes(genome_file)
-    complement_rows = []
-    for chrom in AUTOSOMES:
-        chrom_size = genome_sizes.get(chrom)
-        if not chrom_size:
-            continue
-        chrom_pmd = pmd_union_df.loc[pmd_union_df["chr"].eq(chrom)].sort_values("start")
-        cursor = 0
-        for row in chrom_pmd.itertuples(index=False):
-            if int(row.start) > cursor:
-                complement_rows.append(
-                    {"chr": chrom, "start": cursor, "end": int(row.start)}
-                )
-            cursor = max(cursor, int(row.end))
-        if cursor < chrom_size:
-            complement_rows.append({"chr": chrom, "start": cursor, "end": chrom_size})
-    complement = normalize_region_df(pd.DataFrame(complement_rows))
-    probe = probe_df.rename(
-        columns={"CpG_chrm": "chr", "CpG_beg": "start", "CpG_end": "end"}
-    ).loc[:, ["chr", "start", "end"]]
-    non_pmd = _regions_with_any_overlap(complement, probe)
-    return non_pmd.loc[non_pmd["chr"].isin(AUTOSOMES)].reset_index(drop=True)
-
-
-def build_candidate_control_space(
-    pmd_support_df: pd.DataFrame,
-    probe_df: pd.DataFrame,
-    genome_file: str | Path,
-    high_confidence_pmd_min_fraction: float,
-) -> pd.DataFrame:
-    recurrent_pmds = select_high_confidence_pmds(
-        pmd_support_df, high_confidence_pmd_min_fraction
-    )
-    return build_non_pmd_regions(recurrent_pmds, probe_df, genome_file)
-
-
-def select_high_confidence_pmds(
-    pmd_support_df: pd.DataFrame,
-    high_confidence_pmd_min_fraction: float,
-) -> pd.DataFrame:
-    if pmd_support_df.empty:
-        return pd.DataFrame(columns=["chr", "start", "end", "length"])
-    if "support_fraction" not in pmd_support_df.columns:
-        raise ValueError("PMD support table must include support_fraction.")
-    if (
-        high_confidence_pmd_min_fraction < 0
-        or high_confidence_pmd_min_fraction > 1
-    ):
-        raise ValueError("high_confidence_pmd_min_fraction must be between 0 and 1.")
-    return pmd_support_df.loc[
-        pmd_support_df["support_fraction"] >= float(high_confidence_pmd_min_fraction)
-    ].copy()
-
-
-def region_has_cpgs(
-    meth_data_df: pd.DataFrame, chrom: str, start: int, end: int
-) -> bool:
-    subset = meth_data_df.loc[
-        meth_data_df["CpG_chrm"].astype(str).eq(str(chrom))
-        & (meth_data_df["CpG_beg"] < int(end))
-        & (meth_data_df["CpG_end"] > int(start))
-    ]
-    if subset.empty:
-        return False
-    beta_cols = [col for col in subset.columns if col not in COORD_COLS]
-    return not subset.loc[:, beta_cols].isna().all(axis=0).any()
-
-
-def subtract_interval_from_pool(
-    pool_df: pd.DataFrame, chrom: str, used_start: int, used_end: int
-) -> pd.DataFrame:
-    pool = normalize_region_df(pool_df)
-    kept = []
-    for row in pool.itertuples(index=False):
-        if (
-            str(row.chr) != str(chrom)
-            or int(row.end) <= used_start
-            or int(row.start) >= used_end
-        ):
-            kept.append({"chr": row.chr, "start": int(row.start), "end": int(row.end)})
-            continue
-        if int(row.start) < used_start:
-            kept.append(
-                {"chr": row.chr, "start": int(row.start), "end": int(used_start)}
-            )
-        if int(row.end) > used_end:
-            kept.append({"chr": row.chr, "start": int(used_end), "end": int(row.end)})
-    return normalize_region_df(pd.DataFrame(kept))
-
-
-def sample_random_non_pmd_regions(
-    selected_pmd_df: pd.DataFrame,
-    non_pmd_df: pd.DataFrame,
-    seed: int,
-    random_region_min_length_bp: int,
-    random_region_max_length_bp: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    rng = random.Random(seed)
-    pool = normalize_region_df(non_pmd_df)
-    selected = normalize_region_df(selected_pmd_df)
-    if selected.empty:
-        return make_region_ids(pd.DataFrame(), "random"), pd.DataFrame()
-    min_len = int(random_region_min_length_bp)
-    max_len = int(random_region_max_length_bp)
-    if min_len <= 0 or max_len <= 0:
-        raise ValueError("Random region min/max lengths must be positive integers.")
-    if min_len > max_len:
-        raise ValueError(
-            "random_region_min_length_bp cannot exceed random_region_max_length_bp."
-        )
-    random_rows = []
-    skipped = []
-    for pmd in selected.itertuples(index=False):
-        candidates = pool.loc[
-            pool["chr"].astype(str).eq(str(pmd.chr))
-            & (pool["length"] >= min_len)
-        ].copy()
-        chosen = None
-        if not candidates.empty:
-            candidate_rows = []
-            weights = []
-            for row in candidates.itertuples(index=False):
-                upper_len = min(max_len, int(row.length))
-                if upper_len < min_len:
-                    continue
-                feasible_positions = 0
-                for length in range(min_len, upper_len + 1):
-                    feasible_positions += int(row.length) - length + 1
-                if feasible_positions <= 0:
-                    continue
-                candidate_rows.append(row)
-                weights.append(feasible_positions)
-            if candidate_rows:
-                chosen_row = rng.choices(candidate_rows, weights=weights, k=1)[0]
-                upper_len = min(max_len, int(chosen_row.length))
-                chosen_len = rng.randint(min_len, upper_len)
-                if chosen_len == int(chosen_row.length):
-                    chosen_start = int(chosen_row.start)
-                    chosen_end = int(chosen_row.end)
-                    match_type = "chromosome_matched_interval_at_sampled_length"
-                elif rng.random() < 0.5:
-                    chosen_start = int(chosen_row.start)
-                    chosen_end = chosen_start + chosen_len
-                    match_type = "chromosome_matched_left_edge_subinterval"
-                else:
-                    chosen_end = int(chosen_row.end)
-                    chosen_start = chosen_end - chosen_len
-                    match_type = "chromosome_matched_right_edge_subinterval"
-                chosen = {
-                    "chr": chosen_row.chr,
-                    "start": chosen_start,
-                    "end": chosen_end,
-                    "requested_length": int(pmd.end - pmd.start),
-                    "sampled_length": chosen_len,
-                    "match_type": match_type,
-                    "source_region_id": getattr(pmd, "region_id", ""),
-                }
-        if chosen is None:
-            skipped.append(
-                {
-                    "source_region_id": getattr(pmd, "region_id", ""),
-                    "requested_length": int(pmd.end - pmd.start),
-                    "reason": (
-                        "no same-chromosome control interval with enough remaining "
-                        f"space for configured random region bounds {min_len}-{max_len} bp"
-                    ),
-                }
-            )
-        else:
-            random_rows.append(chosen)
-            pool = subtract_interval_from_pool(
-                pool,
-                chosen["chr"],
-                int(chosen["start"]),
-                int(chosen["end"]),
-            )
-    random_df = make_region_ids(pd.DataFrame(random_rows), "random")
-    if not random_df.empty:
-        random_df["feature_set"] = "Random"
-    return random_df, pd.DataFrame(skipped)
-
-
-def load_cgi_regions(cgi_bed: str | Path, probe_df: pd.DataFrame) -> pd.DataFrame:
-    cgi = read_bed(cgi_bed)
-    cgi = cgi.loc[cgi["chr"].isin(AUTOSOMES)].reset_index(drop=True)
-    cgi = probe_supported_regions(cgi, probe_df)
-    cgi = make_region_ids(cgi, "cgi")
-    cgi["feature_set"] = "CGI"
-    return cgi
-
-
-def sample_cgi_regions(
-    cgi_df: pd.DataFrame, n_regions: int, seed: int
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if cgi_df.empty:
-        return cgi_df.copy(), pd.DataFrame(
-            [{"warning": "No CGI regions with probe support were available."}]
-        )
-    n_take = min(int(n_regions), len(cgi_df))
-    selected = cgi_df.sample(n=n_take, random_state=seed).reset_index(drop=True)
-    warnings = []
-    if n_take < n_regions:
-        warnings.append(
-            {
-                "warning": f"Only {n_take} CGI regions were available for requested n={n_regions}."
-            }
-        )
-    return selected, pd.DataFrame(warnings)
-
-
-def extract_feature_matrix(
-    regions_df: pd.DataFrame,
-    samples_df: pd.DataFrame,
-    meth_data_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    regions = (
-        make_region_ids(regions_df, "region")
-        if "region_id" not in regions_df.columns
-        else regions_df.copy()
-    )
-    sample_ids = samples_df["sample_id"].astype(str).tolist()
-    features = {}
-    dropped_rows = []
-    for region in regions.itertuples(index=False):
-        subset = meth_data_df.loc[
-            meth_data_df["CpG_chrm"].astype(str).eq(str(region.chr))
-            & (meth_data_df["CpG_beg"] < int(region.end))
-            & (meth_data_df["CpG_end"] > int(region.start))
-        ]
-        feature_name = str(region.region_id)
-        if subset.empty:
-            dropped_rows.append(
-                {"region_id": feature_name, "reason": "no_overlapping_cpgs"}
-            )
-            continue
-        values = subset.loc[:, sample_ids].mean(axis=0, skipna=True)
-        if values.isna().all():
-            dropped_rows.append(
-                {"region_id": feature_name, "reason": "all_missing_beta"}
-            )
-            continue
-        features[feature_name] = values
-    X = pd.DataFrame(features, index=sample_ids)
-    X.index.name = "sample_id"
-    return X, pd.DataFrame(dropped_rows)
-
-
-def prepare_train_test_data(
-    X: pd.DataFrame,
-    labels: pd.Series,
-    train_ids: Sequence[str],
-    test_ids: Sequence[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
-    X_train = X.loc[list(train_ids)].copy()
-    X_test = X.loc[list(test_ids)].copy()
-    y_train = labels.loc[list(train_ids)]
-    y_test = labels.loc[list(test_ids)]
-    dropped = []
-    all_missing_cols = X_train.columns[X_train.isna().all(axis=0)].tolist()
-    if all_missing_cols:
-        dropped = [
-            {"region_id": col, "reason": "all_missing_training"}
-            for col in all_missing_cols
-        ]
-        X_train = X_train.drop(columns=all_missing_cols)
-        X_test = X_test.drop(columns=all_missing_cols)
-    if X_train.shape[1] == 0:
-        raise ValueError(
-            "No usable feature columns remain after training-set filtering."
-        )
-    imputer = SimpleImputer(strategy="mean")
-    X_train = pd.DataFrame(
-        imputer.fit_transform(X_train), index=X_train.index, columns=X_train.columns
-    )
-    X_test = pd.DataFrame(
-        imputer.transform(X_test), index=X_test.index, columns=X_test.columns
-    )
-    return X_train, X_test, y_train, y_test, pd.DataFrame(dropped)
-
-
-def prediction_tables_for_model(
-    X: pd.DataFrame,
-    labels: pd.Series,
-    train_ids: Sequence[str],
-    test_ids: Sequence[str],
-    metadata: dict,
-    n_estimators: int,
-    random_state: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    X_train, X_test, y_train, y_test, dropped = prepare_train_test_data(
-        X, labels, train_ids, test_ids
-    )
-    clf = RandomForestClassifier(
-        n_estimators=n_estimators,
-        random_state=random_state,
-        class_weight="balanced",
-    )
-    clf.fit(X_train, y_train)
-    y_pred = pd.Series(clf.predict(X_test), index=y_test.index)
-    predictions = []
-    for sample_id in y_test.index:
-        row = {
-            **metadata,
-            "sample_id": sample_id,
-            "true_label": str(y_test.loc[sample_id]),
-            "predicted_label": str(y_pred.loc[sample_id]),
-            "n_features_used": int(X_train.shape[1]),
-        }
-        predictions.append(row)
-    pred_df = pd.DataFrame(predictions)
-    score_df = pd.DataFrame(
-        clf.predict_proba(X_test),
-        index=X_test.index,
-        columns=[str(c) for c in clf.classes_],
-    )
-    score_records = []
-    for sample_id, score_row in score_df.iterrows():
-        for class_label, score in score_row.items():
-            score_records.append(
-                {
-                    **metadata,
-                    "sample_id": sample_id,
-                    "class_label": class_label,
-                    "score": float(score),
-                }
-            )
-    return pred_df, pd.DataFrame(score_records), dropped
-
-
-def baseline_prediction_tables(
-    labels: pd.Series,
-    train_ids: Sequence[str],
-    test_ids: Sequence[str],
-    task_type: str,
-    metadata: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    y_train = labels.loc[list(train_ids)]
-    y_test = labels.loc[list(test_ids)]
-    if task_type == "binary":
-        predicted = "Cancer"
-        classes = ["Solid Tissue Normal", "Cancer"]
-    else:
-        predicted = str(y_train.astype(str).value_counts().idxmax())
-        classes = sorted(labels.astype(str).unique())
-    pred_df = pd.DataFrame(
-        [
-            {
-                **metadata,
-                "sample_id": sample_id,
-                "true_label": str(y_test.loc[sample_id]),
-                "predicted_label": predicted,
-                "n_features_used": 0,
-            }
-            for sample_id in y_test.index
-        ]
-    )
-    score_records = []
-    for sample_id in y_test.index:
-        for class_label in classes:
-            score_records.append(
-                {
-                    **metadata,
-                    "sample_id": sample_id,
-                    "class_label": class_label,
-                    "score": 1.0 if class_label == predicted else 0.0,
-                }
-            )
-    return pred_df, pd.DataFrame(score_records)
-
-
-def random_class_prediction_tables(
-    labels: pd.Series,
-    train_ids: Sequence[str],
-    test_ids: Sequence[str],
-    metadata: dict,
-    seed: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    y_train = labels.loc[list(train_ids)].astype(str)
-    y_test = labels.loc[list(test_ids)].astype(str)
-    class_probs = y_train.value_counts(normalize=True).sort_index()
-    classes = class_probs.index.astype(str).tolist()
-    probs = class_probs.to_numpy(dtype=float)
-    rng = np.random.default_rng(seed)
-    sampled = rng.choice(classes, size=len(y_test), replace=True, p=probs)
-    pred_df = pd.DataFrame(
-        [
-            {
-                **metadata,
-                "sample_id": sample_id,
-                "true_label": str(y_test.loc[sample_id]),
-                "predicted_label": str(predicted_label),
-                "n_features_used": 0,
-            }
-            for sample_id, predicted_label in zip(y_test.index, sampled)
-        ]
-    )
-    score_records = []
-    for sample_id in y_test.index:
-        for class_label, score in zip(classes, probs):
-            score_records.append(
-                {
-                    **metadata,
-                    "sample_id": sample_id,
-                    "class_label": class_label,
-                    "score": float(score),
-                }
-            )
-    return pred_df, pd.DataFrame(score_records)
-
-
-def compute_group_metrics(group: pd.DataFrame) -> dict:
-    y_true = group["true_label"].astype(str)
-    y_pred = group["predicted_label"].astype(str)
-    labels = sorted(set(y_true).union(set(y_pred)))
-    _, _, macro_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="macro", zero_division=0
-    )
-    if group["task_type"].iloc[0] == "binary":
-        cm = confusion_matrix(y_true, y_pred, labels=["Solid Tissue Normal", "Cancer"])
-        if cm.shape == (2, 2):
-            tn, fp, fn, tp = cm.ravel()
-            specificity = tn / (tn + fp) if (tn + fp) else 0.0
-            negative_precision = tn / (tn + fn) if (tn + fn) else 0.0
-        else:
-            specificity = 0.0
-            negative_precision = 0.0
-    else:
-        mcm = multilabel_confusion_matrix(y_true, y_pred, labels=labels)
-        specificities = []
-        negative_precisions = []
-        for cm in mcm:
-            tn, fp, fn, tp = cm.ravel()
-            specificities.append(tn / (tn + fp) if (tn + fp) else 0.0)
-            negative_precisions.append(tn / (tn + fn) if (tn + fn) else 0.0)
-        specificity = float(np.mean(specificities)) if specificities else 0.0
-        negative_precision = (
-            float(np.mean(negative_precisions)) if negative_precisions else 0.0
-        )
+def make_sample_types(samples_info: pd.DataFrame) -> dict[str, str]:
     return {
-        "mcc": float(matthews_corrcoef(y_true, y_pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "macro_f1": float(macro_f1),
-        "specificity": float(specificity),
-        "negative_precision": float(negative_precision),
+        str(sample): ('Normal' if str(sample_type) == 'Solid Tissue Normal' else 'Tumor')
+        for sample, sample_type in zip(samples_info['sample'], samples_info['sample_type'])
     }
 
 
-def recalculate_metric_tables(
-    predictions_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    group_cols = [
-        "case_set",
-        "cohort_id",
-        "cohort_label",
-        "task_type",
-        "feature_set",
-        "n_regions_requested",
-        "fold",
-    ]
-    metric_rows = []
-    for keys, group in predictions_df.groupby(group_cols, dropna=False, sort=False):
-        row = dict(zip(group_cols, keys))
-        row.update(compute_group_metrics(group))
-        row["n_test_samples"] = int(group["sample_id"].nunique())
-        row["n_features_used"] = int(group["n_features_used"].max())
-        metric_rows.append(row)
-    fold_metrics = add_feature_order(pd.DataFrame(metric_rows))
-
-    summary_rows = []
-    summary_cols = [c for c in group_cols if c != "fold"]
-    for keys, group in fold_metrics.groupby(summary_cols, dropna=False, sort=False):
-        row = dict(zip(summary_cols, keys))
-        row["n_folds_completed"] = int(group["fold"].nunique())
-        row["mean_n_features_used"] = float(group["n_features_used"].mean())
-        for metric in METRIC_COLS:
-            row[f"{metric}_mean"] = float(group[metric].mean())
-            row[f"{metric}_std"] = float(group[metric].std()) if len(group) > 1 else 0.0
-            row[f"{metric}_median"] = float(group[metric].median())
-            row[f"{metric}_min"] = float(group[metric].min())
-            row[f"{metric}_max"] = float(group[metric].max())
-        summary_rows.append(row)
-    summary = add_feature_order(pd.DataFrame(summary_rows))
-
-    class_rows = []
-    for keys, group in predictions_df.groupby(group_cols, dropna=False, sort=False):
-        base = dict(zip(group_cols, keys))
-        labels = sorted(
-            set(group["true_label"].astype(str)).union(
-                group["predicted_label"].astype(str)
-            )
-        )
-        precision, recall, f1, support = precision_recall_fscore_support(
-            group["true_label"].astype(str),
-            group["predicted_label"].astype(str),
-            labels=labels,
-            zero_division=0,
-        )
-        for label, p, r, f, s in zip(labels, precision, recall, f1, support):
-            class_rows.append(
-                {
-                    **base,
-                    "class_label": label,
-                    "precision": float(p),
-                    "recall": float(r),
-                    "f1": float(f),
-                    "support": int(s),
-                }
-            )
-    per_class = add_feature_order(pd.DataFrame(class_rows))
-
-    confusion_rows = []
-    for keys, group in predictions_df.groupby(group_cols, dropna=False, sort=False):
-        base = dict(zip(group_cols, keys))
-        labels = sorted(
-            set(group["true_label"].astype(str)).union(
-                group["predicted_label"].astype(str)
-            )
-        )
-        cm = confusion_matrix(
-            group["true_label"], group["predicted_label"], labels=labels
-        )
-        for i, true_label in enumerate(labels):
-            for j, predicted_label in enumerate(labels):
-                confusion_rows.append(
-                    {
-                        **base,
-                        "true_label": true_label,
-                        "predicted_label": predicted_label,
-                        "count": int(cm[i, j]),
-                    }
-                )
-    confusion = add_feature_order(pd.DataFrame(confusion_rows))
-    return fold_metrics, summary, per_class, confusion
-
-
-def build_elbow_summary(
-    summary_df: pd.DataFrame, metric: str = "mcc_mean"
-) -> pd.DataFrame:
-    rows = []
-    group_cols = ["case_set", "cohort_id", "cohort_label", "feature_set"]
-    if summary_df.empty or metric not in summary_df.columns:
-        return pd.DataFrame()
-    for keys, group in summary_df.groupby(group_cols, sort=False):
-        group = group.dropna(subset=[metric]).copy()
-        if group.empty:
-            continue
-        best = group[metric].max()
-        threshold = 0.95 * best
-        eligible = group.loc[group[metric] >= threshold].sort_values(
-            "n_regions_requested"
-        )
-        row = dict(zip(group_cols, keys))
-        row["metric"] = metric
-        row["best_value"] = float(best)
-        row["threshold_95pct_best"] = float(threshold)
-        row["elbow_n_regions"] = int(eligible.iloc[0]["n_regions_requested"])
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def save_feature_matrix(X: pd.DataFrame, path_base: Path) -> Path:
-    ensure_dir(path_base.parent)
-    try:
-        path = path_base.with_suffix(".parquet")
-        X.to_parquet(path, compression="snappy")
-        return path
-    except Exception:
-        path = path_base.with_suffix(".tsv.gz")
-        X.to_csv(path, sep="\t", compression="gzip")
-        return path
-
-
-def save_selected_regions(
-    regions_df: pd.DataFrame, out_dir: Path, metadata: dict
-) -> Path:
-    region_path = (
-        out_dir
-        / "selected_regions"
-        / safe_name(metadata["case_set"])
-        / safe_name(metadata["cohort_id"])
-        / safe_name(metadata["feature_set"])
-        / f"n{int(metadata['n_regions_requested']):04d}_fold{int(metadata['fold']):02d}.tsv"
-    )
-    regions = regions_df.copy()
-    for key, value in metadata.items():
-        regions[key] = value
-    return write_table(regions, region_path)
-
-
-def save_random_failure_debug_artifacts(
-    *,
-    out_dir: Path,
-    metadata: dict,
-    selected_pmd_df: pd.DataFrame,
-    high_confidence_pmd_df: pd.DataFrame,
-    control_space_df: pd.DataFrame,
-    random_regions_df: pd.DataFrame,
-    random_audit_df: pd.DataFrame,
-) -> Path:
-    debug_dir = ensure_dir(
-        out_dir
-        / "random_failure_debug"
-        / safe_name(metadata["case_set"])
-        / safe_name(metadata["cohort_id"])
-        / f"n{int(metadata['n_regions_requested']):04d}_fold{int(metadata['fold']):02d}"
-    )
-    selected = selected_pmd_df.copy()
-    high_conf = high_confidence_pmd_df.copy()
-    control_space = control_space_df.copy()
-    random_regions = random_regions_df.copy()
-    random_audit = random_audit_df.copy()
-
-    if "source_region_id" in random_audit.columns and "region_id" in selected.columns:
-        source_map = selected.loc[:, ["region_id", "chr", "start", "end"]].rename(
-            columns={
-                "region_id": "source_region_id",
-                "chr": "failed_chr",
-                "start": "failed_start",
-                "end": "failed_end",
-            }
-        )
-        random_audit = random_audit.merge(source_map, on="source_region_id", how="left")
-    else:
-        random_audit["failed_chr"] = pd.Series(dtype=str)
-        random_audit["failed_start"] = pd.Series(dtype=float)
-        random_audit["failed_end"] = pd.Series(dtype=float)
-
-    failed_chroms = (
-        random_audit["failed_chr"].dropna().astype(str).drop_duplicates().tolist()
-        if not random_audit.empty
-        else []
-    )
-    summary_rows = []
-    for chrom in failed_chroms:
-        chrom_name = safe_name(chrom)
-        failed_requested = random_audit.loc[random_audit["failed_chr"].astype(str).eq(chrom)].copy()
-        selected_chrom = selected.loc[selected["chr"].astype(str).eq(chrom)].copy()
-        high_conf_chrom = high_conf.loc[high_conf["chr"].astype(str).eq(chrom)].copy()
-        control_space_chrom = control_space.loc[
-            control_space["chr"].astype(str).eq(chrom)
-        ].copy()
-        sampled_random_chrom = random_regions.loc[
-            random_regions["chr"].astype(str).eq(chrom)
-        ].copy()
-
-        failed_path = write_table(
-            failed_requested,
-            debug_dir / f"{chrom_name}__failed_requested_pmds.tsv",
-        )
-        selected_path = write_table(
-            selected_chrom,
-            debug_dir / f"{chrom_name}__selected_pmds.tsv",
-        )
-        high_conf_path = write_table(
-            high_conf_chrom,
-            debug_dir / f"{chrom_name}__high_confidence_pmds.tsv",
-        )
-        control_space_path = write_table(
-            control_space_chrom,
-            debug_dir / f"{chrom_name}__remaining_random_space.tsv",
-        )
-        sampled_random_path = write_table(
-            sampled_random_chrom,
-            debug_dir / f"{chrom_name}__sampled_random_regions.tsv",
-        )
-        summary_rows.append(
-            {
-                **metadata,
-                "chromosome": chrom,
-                "n_failed_requested_pmds": int(len(failed_requested)),
-                "n_selected_pmds_on_chrom": int(len(selected_chrom)),
-                "n_high_confidence_pmds_on_chrom": int(len(high_conf_chrom)),
-                "n_remaining_random_space_intervals": int(len(control_space_chrom)),
-                "remaining_random_space_bp": int(control_space_chrom.get("length", pd.Series(dtype=int)).sum()),
-                "n_sampled_random_regions_on_chrom": int(len(sampled_random_chrom)),
-                "failed_requested_pmds_path": str(failed_path),
-                "selected_pmds_path": str(selected_path),
-                "high_confidence_pmds_path": str(high_conf_path),
-                "remaining_random_space_path": str(control_space_path),
-                "sampled_random_regions_path": str(sampled_random_path),
-            }
-        )
-
-    if summary_rows:
-        write_table(pd.DataFrame(summary_rows), debug_dir / "random_failure_summary.tsv")
-    else:
-        write_table(random_audit, debug_dir / "random_failure_summary.tsv")
-    return debug_dir
-
-
-def make_feature_status(
-    metadata: dict,
-    feature_set: str,
-    status: str,
-    n_regions_selected: int = 0,
-    failure_reason: str = "",
-) -> dict:
+def summarize_cohort_samples(samples_info: pd.DataFrame) -> dict[str, int]:
+    sample_types = make_sample_types(samples_info)
+    labels = pd.Series(sample_types, dtype='object')
     return {
-        **metadata,
-        "feature_set": feature_set,
-        "status": status,
-        "n_regions_selected": int(n_regions_selected),
-        "failure_reason": failure_reason,
+        'n_samples': int(len(labels)),
+        'n_tumor_samples': int(labels.eq('Tumor').sum()),
+        'n_normal_samples': int(labels.eq('Normal').sum()),
     }
 
 
-def raise_or_record_missing_feature(
+def build_per_cancer_cohort_manifest(
+    samples_info: pd.DataFrame,
     *,
-    out_dir: Path,
-    feature_status_rows: list[dict],
-    metadata: dict,
-    feature_set: str,
-    failure_reason: str,
-    allow_missing_feature_sets: bool,
-) -> None:
-    feature_status_rows.append(
-        make_feature_status(
-            metadata,
-            feature_set,
-            "failed",
-            n_regions_selected=0,
-            failure_reason=failure_reason,
-        )
+    min_splits: int,
+    include_cohorts: Sequence[str] | None = None,
+    exclude_cohorts: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    cohort_df = samples_info.copy()
+    cohort_df['cohort_id'] = cohort_df['project_id'].astype(str)
+    cohort_df['binary_label'] = np.where(
+        cohort_df['sample_type'].astype(str).eq('Solid Tissue Normal'),
+        'Normal',
+        'Tumor',
     )
-    if not allow_missing_feature_sets:
-        write_table(
-            add_feature_order(pd.DataFrame(feature_status_rows)),
-            out_dir / "feature_set_status.tsv",
-        )
-        raise ValueError(
-            f"{feature_set} failed for {metadata['case_set']} / {metadata['cohort_id']} "
-            f"fold={metadata['fold']} n={metadata['n_regions_requested']}: {failure_reason}. "
-            "Use --allow-missing-feature-sets only for diagnostics."
-        )
-
-
-def run_pipeline(config: PipelineConfig) -> dict[str, Path]:
-    out_dir = ensure_dir(config.out_dir)
-    if (
-        config.high_confidence_pmd_min_fraction < 0
-        or config.high_confidence_pmd_min_fraction > 1
-    ):
-        raise ValueError("high_confidence_pmd_min_fraction must be between 0 and 1.")
-    if config.random_region_min_length_bp <= 0 or config.random_region_max_length_bp <= 0:
-        raise ValueError("Random region min/max lengths must be positive integers.")
-    if config.random_region_min_length_bp > config.random_region_max_length_bp:
-        raise ValueError(
-            "random_region_min_length_bp cannot exceed random_region_max_length_bp."
-        )
-    write_json(
-        {
-            **asdict(config),
-            "out_dir": str(config.out_dir),
-            "segmentation_root": str(config.segmentation_root),
-            "cgi_bed": str(config.cgi_bed),
-            "genome_file": str(config.genome_file),
-            "n_values": list(config.n_values or DEFAULT_N_VALUES),
-        },
-        out_dir / "run_config.json",
+    counts = (
+        cohort_df.groupby(['cohort_id', 'binary_label'], as_index=False)
+        .size()
+        .pivot(index='cohort_id', columns='binary_label', values='size')
+        .fillna(0)
+        .reset_index()
+    )
+    if 'Tumor' not in counts.columns:
+        counts['Tumor'] = 0
+    if 'Normal' not in counts.columns:
+        counts['Normal'] = 0
+    counts['n_samples'] = counts['Tumor'].astype(int) + counts['Normal'].astype(int)
+    counts['n_tumor_samples'] = counts['Tumor'].astype(int)
+    counts['n_normal_samples'] = counts['Normal'].astype(int)
+    counts = counts.rename(columns={'cohort_id': 'cohort_id'})
+    counts = counts[['cohort_id', 'n_samples', 'n_tumor_samples', 'n_normal_samples']].copy()
+    counts['is_eligible'] = (
+        counts['n_tumor_samples'].ge(int(min_splits))
+        & counts['n_normal_samples'].ge(int(min_splits))
     )
 
-    all_samples = load_tcga_samples_info()
-    cohorts, cohort_warnings = build_case_cohorts(
-        all_samples,
-        case_sets=config.case_sets,
-        cv_splits=config.cv_splits,
-        random_state=config.random_state,
-        max_samples_per_class=config.max_samples_per_class,
-    )
-    if not cohorts:
-        raise ValueError("No cohorts were available for the requested case sets.")
-    n_values = tuple(config.n_values or DEFAULT_N_VALUES)
+    if include_cohorts:
+        include = {str(value) for value in include_cohorts}
+        counts = counts.loc[counts['cohort_id'].isin(include)].copy()
+    if exclude_cohorts:
+        exclude = {str(value) for value in exclude_cohorts}
+        counts = counts.loc[~counts['cohort_id'].isin(exclude)].copy()
 
-    pmd_call_status = ensure_missing_pmds(
-        cohorts,
-        config.segmentation_root,
-        call_missing_pmds=config.call_missing_pmds,
-    )
-    write_table(pmd_call_status, out_dir / "pmd_call_status.tsv")
-
-    preflight_status = validate_pmd_preflight(cohorts, config.segmentation_root)
-    write_table(preflight_status, out_dir / "pmd_preflight_status.tsv")
-    missing_preflight = preflight_status.loc[preflight_status["status"].ne("available")]
-    if not missing_preflight.empty and not config.allow_missing_feature_sets:
-        write_table(
-            add_feature_order(preflight_status),
-            out_dir / "feature_set_status.tsv",
-        )
-        example = missing_preflight.head(8).loc[
-            :, ["case_set", "cohort_id", "sample_id", "failure_reason"]
-        ]
-        raise ValueError(
-            "PMD preflight failed. PMD and Random are required by default, "
-            "but some candidate tumor samples do not have PMD files under "
-            f"{config.segmentation_root}. Examples: {example.to_dict(orient='records')}. "
-            "Use --allow-missing-feature-sets only for diagnostics."
-        )
-
-    all_cohort_samples = pd.concat(
-        [cohort["samples_df"] for cohort in cohorts], ignore_index=True
-    ).drop_duplicates("sample_id")
-    write_table(all_cohort_samples, out_dir / "sample_metadata.tsv")
-    cohort_summary = []
-    for cohort in cohorts:
-        labels = build_labels(cohort["samples_df"], cohort["task_type"])
-        for label, n_samples in labels.value_counts().items():
-            cohort_summary.append(
-                {
-                    "case_set": cohort["case_set"],
-                    "cohort_id": cohort["cohort_id"],
-                    "cohort_label": cohort["cohort_label"],
-                    "task_type": cohort["task_type"],
-                    "label": label,
-                    "n_samples": int(n_samples),
-                }
-            )
-    write_table(pd.DataFrame(cohort_summary), out_dir / "cohort_summary.tsv")
-
-    meth_ref_df = load_meth_ref()
-    probe_df = prepare_probe_df(meth_ref_df)
-    cgi_df = load_cgi_regions(config.cgi_bed, probe_df)
-    meth_data_df, meth_warnings = build_wide_methylation_table(
-        all_cohort_samples, meth_ref_df
-    )
-
-    prediction_frames = []
-    score_frames = []
-    split_rows = []
-    warning_frames = [cohort_warnings, meth_warnings]
-    audit_frames = []
-    feature_status_rows: list[dict] = []
-
-    for cohort in cohorts:
-        samples_df = cohort["samples_df"].copy().reset_index(drop=True)
-        labels = build_labels(samples_df, cohort["task_type"])
-        splitter = StratifiedKFold(
-            n_splits=config.cv_splits, shuffle=True, random_state=config.random_state
-        )
-        for fold, (train_idx, test_idx) in enumerate(
-            splitter.split(samples_df, labels), start=1
-        ):
-            train_df = samples_df.iloc[train_idx].reset_index(drop=True)
-            test_df = samples_df.iloc[test_idx].reset_index(drop=True)
-            train_ids = train_df["sample_id"].astype(str).tolist()
-            test_ids = test_df["sample_id"].astype(str).tolist()
-            for sample_id in train_ids:
-                split_rows.append(
-                    {
-                        "case_set": cohort["case_set"],
-                        "cohort_id": cohort["cohort_id"],
-                        "fold": fold,
-                        "split": "train",
-                        "sample_id": sample_id,
-                    }
-                )
-            for sample_id in test_ids:
-                split_rows.append(
-                    {
-                        "case_set": cohort["case_set"],
-                        "cohort_id": cohort["cohort_id"],
-                        "fold": fold,
-                        "split": "test",
-                        "sample_id": sample_id,
-                    }
-                )
-
-            train_tumors = train_df.loc[
-                train_df["sample_type"].eq("Primary Tumor")
-            ].copy()
-            fold_all_pmds, fold_pmd_support, pmd_warnings = prepare_fold_pmd_tables(
-                train_tumors,
-                config.segmentation_root,
-                config.genome_file,
-            )
-            if not pmd_warnings.empty:
-                warning_frames.append(
-                    pmd_warnings.assign(
-                        case_set=cohort["case_set"],
-                        cohort_id=cohort["cohort_id"],
-                        cohort_label=cohort["cohort_label"],
-                        task_type=cohort["task_type"],
-                        fold=int(fold),
-                    )
-                )
-            control_space = build_candidate_control_space(
-                fold_pmd_support,
-                probe_df,
-                config.genome_file,
-                config.high_confidence_pmd_min_fraction,
-            )
-            high_confidence_pmds = select_high_confidence_pmds(
-                fold_pmd_support,
-                config.high_confidence_pmd_min_fraction,
-            )
-            for n_regions in n_values:
-                common_meta = {
-                    "case_set": cohort["case_set"],
-                    "cohort_id": cohort["cohort_id"],
-                    "cohort_label": cohort["cohort_label"],
-                    "task_type": cohort["task_type"],
-                    "n_regions_requested": int(n_regions),
-                    "fold": int(fold),
-                }
-                selected_pmd, fold_pmd_support, selection_warnings = (
-                    select_pmd_regions_from_fold_tables(
-                        train_tumors,
-                        fold_all_pmds,
-                        fold_pmd_support,
-                        config.genome_file,
-                        int(n_regions),
-                        cohort["pmd_strategy"],
-                    )
-                )
-                if not selection_warnings.empty:
-                    warning_frames.append(selection_warnings.assign(**common_meta))
-
-                feature_region_map = {}
-                if not selected_pmd.empty:
-                    feature_region_map["PMD"] = selected_pmd
-                    random_regions, random_audit = sample_random_non_pmd_regions(
-                        selected_pmd,
-                        non_pmd_df=control_space,
-                        seed=config.random_state + fold + int(n_regions),
-                        random_region_min_length_bp=config.random_region_min_length_bp,
-                        random_region_max_length_bp=config.random_region_max_length_bp,
-                    )
-                    if not random_audit.empty:
-                        audit_frames.append(
-                            random_audit.assign(**common_meta, feature_set="Random")
-                        )
-                    if not random_regions.empty and len(random_regions) >= len(
-                        selected_pmd
-                    ):
-                        feature_region_map["Random"] = random_regions
-                    else:
-                        debug_dir = save_random_failure_debug_artifacts(
-                            out_dir=out_dir,
-                            metadata=common_meta,
-                            selected_pmd_df=selected_pmd,
-                            high_confidence_pmd_df=high_confidence_pmds,
-                            control_space_df=control_space,
-                            random_regions_df=random_regions,
-                            random_audit_df=random_audit,
-                        )
-                        failed_chroms = []
-                        if (
-                            not random_audit.empty
-                            and "source_region_id" in random_audit.columns
-                            and "region_id" in selected_pmd.columns
-                        ):
-                            failed_lookup = selected_pmd.loc[
-                                selected_pmd["region_id"].isin(
-                                    random_audit["source_region_id"].astype(str)
-                                ),
-                                "chr",
-                            ]
-                            failed_chroms = (
-                                failed_lookup.astype(str).drop_duplicates().tolist()
-                            )
-                        failure_reason = (
-                            f"Generated {len(random_regions)} random non-PMD regions "
-                            f"for {len(selected_pmd)} selected PMD regions. "
-                            f"Failed chromosome(s): {failed_chroms or ['unknown']}. "
-                            f"Debug artifacts: {debug_dir}"
-                        )
-                        raise_or_record_missing_feature(
-                            out_dir=out_dir,
-                            feature_status_rows=feature_status_rows,
-                            metadata=common_meta,
-                            feature_set="Random",
-                            failure_reason=failure_reason,
-                            allow_missing_feature_sets=config.allow_missing_feature_sets,
-                        )
-                else:
-                    failure_reason = "No PMD regions were selected for this fold and n."
-                    raise_or_record_missing_feature(
-                        out_dir=out_dir,
-                        feature_status_rows=feature_status_rows,
-                        metadata=common_meta,
-                        feature_set="PMD",
-                        failure_reason=failure_reason,
-                        allow_missing_feature_sets=config.allow_missing_feature_sets,
-                    )
-                    warning_frames.append(
-                        pd.DataFrame(
-                            [
-                                {
-                                    **common_meta,
-                                    "warning": failure_reason,
-                                }
-                            ]
-                        )
-                    )
-
-                cgi_regions, cgi_warnings = sample_cgi_regions(
-                    cgi_df,
-                    int(n_regions),
-                    seed=config.random_state + fold + int(n_regions),
-                )
-                if not cgi_warnings.empty:
-                    warning_frames.append(
-                        cgi_warnings.assign(**common_meta, feature_set="CGI")
-                    )
-                if not cgi_regions.empty:
-                    feature_region_map["CGI"] = cgi_regions
-
-                for feature_set, regions_df in feature_region_map.items():
-                    metadata = {**common_meta, "feature_set": feature_set}
-                    save_selected_regions(regions_df, out_dir, metadata)
-                    try:
-                        X, dropped = extract_feature_matrix(
-                            regions_df, samples_df, meth_data_df
-                        )
-                        if not dropped.empty:
-                            audit_frames.append(dropped.assign(**metadata))
-                        if config.save_feature_matrices:
-                            feature_base = (
-                                out_dir
-                                / "feature_matrices"
-                                / safe_name(cohort["case_set"])
-                                / safe_name(cohort["cohort_id"])
-                                / safe_name(feature_set)
-                                / f"n{int(n_regions):04d}_fold{fold:02d}"
-                            )
-                            save_feature_matrix(X, feature_base)
-                        pred_df, score_df, train_dropped = prediction_tables_for_model(
-                            X,
-                            labels,
-                            train_ids,
-                            test_ids,
-                            metadata=metadata,
-                            n_estimators=config.n_estimators,
-                            random_state=config.random_state,
-                        )
-                        if not train_dropped.empty:
-                            audit_frames.append(train_dropped.assign(**metadata))
-                        prediction_frames.append(pred_df)
-                        score_frames.append(score_df)
-                        feature_status_rows.append(
-                            make_feature_status(
-                                metadata,
-                                feature_set,
-                                "completed",
-                                n_regions_selected=len(regions_df),
-                            )
-                        )
-                    except Exception as exc:
-                        raise_or_record_missing_feature(
-                            out_dir=out_dir,
-                            feature_status_rows=feature_status_rows,
-                            metadata=metadata,
-                            feature_set=feature_set,
-                            failure_reason=str(exc),
-                            allow_missing_feature_sets=config.allow_missing_feature_sets,
-                        )
-                        warning_frames.append(
-                            pd.DataFrame(
-                                [
-                                    {
-                                        **metadata,
-                                        "warning": f"{feature_set} failed: {exc}",
-                                    }
-                                ]
-                            )
-                        )
-
-                baseline_name = (
-                    "Always cancer"
-                    if cohort["task_type"] == "binary"
-                    else "Majority class"
-                )
-                baseline_meta = {**common_meta, "feature_set": baseline_name}
-                pred_df, score_df = baseline_prediction_tables(
-                    labels,
-                    train_ids,
-                    test_ids,
-                    task_type=cohort["task_type"],
-                    metadata=baseline_meta,
-                )
-                prediction_frames.append(pred_df)
-                score_frames.append(score_df)
-                feature_status_rows.append(
-                    make_feature_status(
-                        baseline_meta,
-                        baseline_name,
-                        "completed",
-                        n_regions_selected=0,
-                    )
-                )
-                if cohort["task_type"] == "multiclass":
-                    random_meta = {**common_meta, "feature_set": "Random class"}
-                    pred_df, score_df = random_class_prediction_tables(
-                        labels,
-                        train_ids,
-                        test_ids,
-                        metadata=random_meta,
-                        seed=config.random_state + 100000 * fold + int(n_regions),
-                    )
-                    prediction_frames.append(pred_df)
-                    score_frames.append(score_df)
-                    feature_status_rows.append(
-                        make_feature_status(
-                            random_meta,
-                            "Random class",
-                            "completed",
-                            n_regions_selected=0,
-                        )
-                    )
-
-    predictions_df = pd.concat(prediction_frames, ignore_index=True)
-    scores_df = pd.concat(score_frames, ignore_index=True)
-    splits_df = pd.DataFrame(split_rows)
-    warnings_df = concat_nonempty(warning_frames)
-    audits_df = concat_nonempty(audit_frames)
-
-    outputs = write_metric_outputs(out_dir, predictions_df, scores_df, splits_df)
-    write_table(warnings_df, out_dir / "warnings.tsv")
-    write_table(audits_df, out_dir / "feature_audits.tsv")
-    outputs["feature_set_status"] = write_table(
-        add_feature_order(pd.DataFrame(feature_status_rows)),
-        out_dir / "feature_set_status.tsv",
-    )
-    outputs["pmd_preflight_status"] = out_dir / "pmd_preflight_status.tsv"
-    outputs["pmd_call_status"] = out_dir / "pmd_call_status.tsv"
-    return outputs
+    counts = counts.loc[counts['is_eligible']].drop(columns=['is_eligible']).copy()
+    counts = counts.sort_values('cohort_id').reset_index(drop=True)
+    if counts.empty:
+        raise ValueError('No eligible per-cancer cohorts were found for the requested settings.')
+    return counts
 
 
-def write_metric_outputs(
+def save_feature_classification_outputs(
+    results: pd.DataFrame,
+    sampled_feature_regions: pd.DataFrame,
+    *,
     out_dir: str | Path,
-    predictions_df: pd.DataFrame,
-    scores_df: pd.DataFrame | None = None,
-    splits_df: pd.DataFrame | None = None,
+    run_config: dict,
+    fold_predictions: pd.DataFrame | None = None,
 ) -> dict[str, Path]:
     out_dir = ensure_dir(out_dir)
-    outputs: dict[str, Path] = {}
-    outputs["predictions"] = write_table(predictions_df, out_dir / "cv_predictions.tsv")
-    if scores_df is not None:
-        outputs["scores"] = write_table(scores_df, out_dir / "cv_prediction_scores.tsv")
-    if splits_df is not None:
-        outputs["splits"] = write_table(splits_df, out_dir / "cv_splits.tsv")
-
-    fold_metrics, summary, per_class, confusion = recalculate_metric_tables(
-        predictions_df
-    )
-    elbow = build_elbow_summary(summary)
-    outputs["fold_metrics"] = write_table(fold_metrics, out_dir / "fold_metrics.tsv")
-    outputs["summary_metrics"] = write_table(summary, out_dir / "summary_metrics.tsv")
-    outputs["per_class_metrics"] = write_table(
-        per_class, out_dir / "per_class_metrics.tsv"
-    )
-    outputs["confusion_matrix"] = write_table(
-        confusion, out_dir / "confusion_matrix.tsv"
-    )
-    outputs["elbow_summary"] = write_table(elbow, out_dir / "elbow_summary.tsv")
-    plot_metric_outputs(fold_metrics, summary, confusion, out_dir / "plots")
+    outputs = {
+        'classification_results': write_table(results, out_dir / 'classification_results.tsv'),
+        'sampled_feature_regions': write_table(sampled_feature_regions, out_dir / 'sampled_feature_regions.tsv'),
+        'run_config': write_json(run_config, out_dir / 'run_config.json'),
+    }
+    if fold_predictions is not None:
+        outputs['fold_predictions'] = write_table(fold_predictions, out_dir / 'fold_predictions.tsv')
     return outputs
 
 
-def recalculate_metrics_from_dir(out_dir: str | Path) -> dict[str, Path]:
-    out_dir = Path(out_dir)
-    predictions_path = out_dir / "cv_predictions.tsv"
-    scores_path = out_dir / "cv_prediction_scores.tsv"
-    splits_path = out_dir / "cv_splits.tsv"
-    if not predictions_path.exists():
-        raise FileNotFoundError(f"Missing saved predictions: {predictions_path}")
-    predictions_df = pd.read_csv(predictions_path, sep="\t")
-    scores_df = pd.read_csv(scores_path, sep="\t") if scores_path.exists() else None
-    splits_df = pd.read_csv(splits_path, sep="\t") if splits_path.exists() else None
-    return write_metric_outputs(out_dir, predictions_df, scores_df, splits_df)
+def load_saved_feature_classification_task(
+    task_dir: str | Path,
+    *,
+    include_fold_predictions: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict] | tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    task_dir = Path(task_dir)
+    results_path = task_dir / 'classification_results.tsv'
+    sampled_path = task_dir / 'sampled_feature_regions.tsv'
+    fold_predictions_path = task_dir / 'fold_predictions.tsv'
+    config_path = task_dir / 'run_config.json'
+    if not results_path.exists():
+        raise FileNotFoundError(f'Missing classification results: {results_path}')
+    if not sampled_path.exists():
+        raise FileNotFoundError(f'Missing sampled feature regions: {sampled_path}')
+    if not config_path.exists():
+        raise FileNotFoundError(f'Missing run config: {config_path}')
+    results = pd.read_csv(results_path, sep='	')
+    sampled_regions = pd.read_csv(sampled_path, sep='	')
+    run_config = json.loads(config_path.read_text())
+    if not include_fold_predictions:
+        return results, sampled_regions, run_config
+    if not fold_predictions_path.exists():
+        raise FileNotFoundError(f'Missing fold predictions: {fold_predictions_path}')
+    fold_predictions = pd.read_csv(fold_predictions_path, sep='	')
+    return results, sampled_regions, fold_predictions, run_config
 
 
-def plot_metric_outputs(
-    fold_metrics: pd.DataFrame,
-    summary: pd.DataFrame,
-    confusion: pd.DataFrame,
-    plot_dir: str | Path,
-) -> None:
-    plot_dir = ensure_dir(plot_dir)
-    for subdir in [
-        "average_metric_bars",
-        "cv_score_boxplots",
-        "confusion_matrices",
-        "metric_lines",
-    ]:
-        ensure_dir(plot_dir / subdir)
-    if summary.empty and fold_metrics.empty:
+def collect_saved_feature_classification_outputs(
+    out_root: str | Path,
+    cohort_id: str,
+    *,
+    include_fold_predictions: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    cohort_root = Path(out_root) / str(cohort_id)
+    task_dirs = sorted(
+        path for path in cohort_root.glob('n_features_*')
+        if path.is_dir() and (path / 'classification_results.tsv').exists()
+    )
+    if not task_dirs:
+        raise FileNotFoundError(f'No saved feature-classification outputs were found under {cohort_root}.')
+
+    results_frames = []
+    sampled_frames = []
+    fold_prediction_frames = []
+    task_records = []
+    for task_dir in task_dirs:
+        if include_fold_predictions:
+            results_df, sampled_df, fold_predictions_df, run_config = load_saved_feature_classification_task(
+                task_dir,
+                include_fold_predictions=True,
+            )
+            fold_prediction_frames.append(fold_predictions_df)
+        else:
+            results_df, sampled_df, run_config = load_saved_feature_classification_task(task_dir)
+        results_frames.append(results_df)
+        sampled_frames.append(sampled_df)
+        task_record = {
+            'task_dir': str(task_dir),
+            'feature_count': int(run_config['feature_count']),
+            'cohort_id': str(run_config['cohort_id']),
+            'n_results_rows': int(len(results_df)),
+            'n_region_rows': int(len(sampled_df)),
+        }
+        if include_fold_predictions:
+            task_record['n_prediction_rows'] = int(len(fold_predictions_df))
+        task_records.append(task_record)
+
+    results = pd.concat(results_frames, ignore_index=True).sort_values(
+        ['n_features', 'feature_set', 'split', 'feature_draw']
+    ).reset_index(drop=True)
+    sampled_regions = pd.concat(sampled_frames, ignore_index=True).sort_values(
+        ['n_features', 'feature_set', 'split', 'feature_draw', 'region_index']
+    ).reset_index(drop=True)
+    task_summary = pd.DataFrame(task_records).sort_values(['feature_count']).reset_index(drop=True)
+    if not include_fold_predictions:
+        return results, sampled_regions, task_summary
+    fold_predictions = pd.concat(fold_prediction_frames, ignore_index=True).sort_values(
+        ['n_features', 'split', 'sample_id', 'feature_draw', 'feature_set']
+    ).reset_index(drop=True)
+    return results, sampled_regions, fold_predictions, task_summary
+
+
+def run_cohort_feature_classification(
+    *,
+    cohort_id: str,
+    feature_count: int,
+    n_splits: int,
+    n_repeats: int,
+    n_feature_draws: int,
+    random_seed: int,
+    max_split_workers: int | None,
+    out_root: str | Path,
+    exclude_top_normal_shared_pmds: bool = False,
+    min_cpgs_for_random_regions: int = 1,
+) -> dict[str, Path]:
+    samples_info = load_tcga_samples(str(cohort_id)).reset_index(drop=True)
+    if samples_info.empty:
+        raise ValueError(f'No TCGA samples were found for cohort {cohort_id}.')
+
+    sample_summary = summarize_cohort_samples(samples_info)
+    if sample_summary['n_tumor_samples'] < int(n_splits) or sample_summary['n_normal_samples'] < int(n_splits):
+        raise ValueError(
+            f'Cohort {cohort_id} does not have enough tumor and normal samples for n_splits={int(n_splits)}.'
+        )
+
+    meth_data = load_methylation_data(samples_info)
+    sample_types = make_sample_types(samples_info)
+    pmds_per_sample = load_pmds_per_sample(samples_info)
+    cgis = load_cgis()
+    results, sampled_feature_regions, fold_predictions = run_feature_classification(
+        meth_data=meth_data,
+        sample_types=sample_types,
+        pmds_per_sample=pmds_per_sample,
+        cgis=cgis,
+        feature_counts=[int(feature_count)],
+        n_splits=int(n_splits),
+        n_repeats=int(n_repeats),
+        n_feature_draws=int(n_feature_draws),
+        random_seed=int(random_seed),
+        max_split_workers=max_split_workers,
+        return_fold_predictions=True,
+        exclude_top_normal_shared_pmds=bool(exclude_top_normal_shared_pmds),
+        min_cpgs_for_random_regions=int(min_cpgs_for_random_regions),
+    )
+
+    for frame in (results, sampled_feature_regions, fold_predictions):
+        frame['cohort_id'] = str(cohort_id)
+        for key, value in sample_summary.items():
+            frame[key] = int(value)
+
+    run_config = {
+        'cohort_id': str(cohort_id),
+        'feature_count': int(feature_count),
+        'n_splits': int(n_splits),
+        'n_repeats': int(n_repeats),
+        'n_feature_draws': int(n_feature_draws),
+        'random_seed': int(random_seed),
+        'max_split_workers': int(MAX_SPLIT_WORKERS if max_split_workers is None else max_split_workers),
+        'exclude_top_normal_shared_pmds': bool(exclude_top_normal_shared_pmds),
+        'min_cpgs_for_random_regions': max(1, int(min_cpgs_for_random_regions)),
+        'out_root': str(Path(out_root)),
+        'sample_summary': sample_summary,
+    }
+    return save_feature_classification_outputs(
+        results,
+        sampled_feature_regions,
+        out_dir=cohort_output_dir(out_root, cohort_id, feature_count),
+        run_config=run_config,
+        fold_predictions=fold_predictions,
+    )
+def load_tcga_samples(cancer_type = None):
+    """
+    Load TCGA samples for a given cancer type.
+
+    Parameters:
+    cancer_type (str): The type of cancer to load samples for. If None, load all samples.
+
+    Returns:
+    pd.DataFrame: A DataFrame containing the TCGA samples.
+    """
+
+    samples_info_path = pd.read_csv(TCGA_SAMPLES, sep='\t')
+
+    if cancer_type:
+        tcga_samples = samples_info_path[samples_info_path['project_id'] == cancer_type]
+    else:
+        tcga_samples = samples_info_path
+
+    return tcga_samples
+
+def load_methylation_data(samples_info):
+    """
+    Load methylation data for each sample.
+
+    Parameters
+    ----------
+    samples_info : pd.DataFrame
+        Must contain:
+        - sample
+        - methylation_file
+
+    Returns
+    -------
+    pd.DataFrame
+        CpG coordinates followed by one methylation column per sample.
+    """
+
+    meth_ref = pd.read_csv(METH_REF, sep="\t")
+
+    required_ref_columns = ["CpG_chrm", "CpG_beg", "CpG_end"]
+    missing_ref_columns = [
+        column
+        for column in required_ref_columns
+        if column not in meth_ref.columns
+    ]
+
+    if missing_ref_columns:
+        raise ValueError(
+            f"Methylation reference is missing columns: {missing_ref_columns}"
+        )
+
+    meth_vals = {}
+
+    for _, row in samples_info.iterrows():
+        sample_id = row["sample"]
+        meth_file = row["methylation_file"]
+
+        meth = np.load(meth_file).astype(float)
+
+        # 255 represents a missing methylation value.
+        meth[meth == 255] = np.nan
+
+        # Ensure each methylation array matches the CpG reference.
+        if len(meth) != len(meth_ref):
+            raise ValueError(
+                f"Length mismatch for sample {sample_id}: "
+                f"{len(meth)} methylation values but "
+                f"{len(meth_ref)} CpGs in METH_REF."
+            )
+
+        meth_vals[sample_id] = meth
+
+    meth_data_df = pd.DataFrame(meth_vals)
+
+    coordinate_df = (
+        meth_ref[required_ref_columns]
+        .reset_index(drop=True)
+        .copy()
+    )
+
+    meth_data_df = meth_data_df.reset_index(drop=True)
+
+    result = pd.concat(
+        [coordinate_df, meth_data_df],
+        axis=1,
+    )
+
+    return result
+
+
+def build_measured_cpg_anchor_table(meth_data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a reusable HM450K CpG anchor table from the measured methylation data.
+
+    Parameters
+    ----------
+    meth_data : pd.DataFrame
+        CpG coordinate table returned by load_methylation_data().
+
+    Returns
+    -------
+    pd.DataFrame
+        Canonical-chromosome CpG anchors with one anchor position per measured CpG.
+    """
+
+    required_columns = ['CpG_chrm', 'CpG_beg', 'CpG_end']
+    missing_columns = [
+        column for column in required_columns
+        if column not in meth_data.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            f'meth_data is missing CpG coordinate columns required for anchor sampling: {missing_columns}'
+        )
+
+    anchors = meth_data[required_columns].copy()
+    anchors['chrom'] = anchors['CpG_chrm'].astype(str)
+    anchors['start'] = pd.to_numeric(anchors['CpG_beg'], errors='coerce')
+    anchors['end'] = pd.to_numeric(anchors['CpG_end'], errors='coerce')
+    anchors = anchors.dropna(subset=['start', 'end']).copy()
+    anchors['start'] = anchors['start'].astype(int)
+    anchors['end'] = anchors['end'].astype(int)
+    anchors = anchors.loc[anchors['end'] > anchors['start']].copy()
+    anchors = anchors.loc[anchors['chrom'].isin(CANNONICAL_CHROMOSOMES)].copy()
+    anchors['anchor_pos'] = ((anchors['start'] + anchors['end']) // 2).astype(int)
+    anchors['length'] = anchors['end'] - anchors['start']
+    anchors = anchors.drop_duplicates(subset=['chrom', 'anchor_pos']).reset_index(drop=True)
+    return anchors[['chrom', 'start', 'end', 'anchor_pos', 'length']].copy()
+
+
+def _build_cpg_position_lookup(cpg_anchor_df: pd.DataFrame) -> dict[str, np.ndarray]:
+    anchors = cpg_anchor_df.copy()
+    if anchors.empty:
+        return {}
+
+    positions_by_chrom = {}
+    for chrom, chrom_df in anchors.groupby('chrom', sort=False):
+        positions = np.sort(chrom_df['anchor_pos'].to_numpy(dtype=int))
+        if positions.size:
+            positions_by_chrom[str(chrom)] = positions
+    return positions_by_chrom
+
+
+def _count_cpg_positions_in_region(
+    chrom: str,
+    start: int,
+    end: int,
+    cpg_positions_by_chrom: dict[str, np.ndarray] | None,
+) -> int:
+    if cpg_positions_by_chrom is None:
+        return 0
+
+    positions = cpg_positions_by_chrom.get(str(chrom))
+    if positions is None or positions.size == 0:
+        return 0
+
+    start = int(start)
+    end = int(end)
+    left = np.searchsorted(positions, start, side='left')
+    right = np.searchsorted(positions, end, side='left')
+    return int(right - left)
+
+
+def _count_cpg_positions_per_interval(
+    interval_df: pd.DataFrame,
+    cpg_positions_by_chrom: dict[str, np.ndarray] | None,
+) -> np.ndarray:
+    if interval_df.empty:
+        return np.zeros(0, dtype=int)
+    if cpg_positions_by_chrom is None:
+        return np.zeros(len(interval_df), dtype=int)
+
+    intervals = interval_df.reset_index(drop=True)
+    counts = np.zeros(len(intervals), dtype=int)
+    for chrom, chrom_idx in intervals.groupby('chrom', sort=False).groups.items():
+        positions = cpg_positions_by_chrom.get(str(chrom))
+        if positions is None or positions.size == 0:
+            continue
+
+        interval_index = np.asarray(list(chrom_idx), dtype=int)
+        starts = intervals.loc[interval_index, 'start'].to_numpy(dtype=int)
+        ends = intervals.loc[interval_index, 'end'].to_numpy(dtype=int)
+        left = np.searchsorted(positions, starts, side='left')
+        right = np.searchsorted(positions, ends, side='left')
+        counts[interval_index] = right - left
+    return counts
+
+
+def _filter_interval_pool_for_requested_length(
+    candidate_pool: pd.DataFrame,
+    requested_length: int,
+    cpg_positions_by_chrom: dict[str, np.ndarray] | None = None,
+) -> pd.DataFrame:
+    filtered = candidate_pool.loc[
+        candidate_pool['length'] >= int(requested_length)
+    ].reset_index(drop=True)
+    if filtered.empty or cpg_positions_by_chrom is None:
+        return filtered
+
+    filtered = filtered.copy()
+    filtered['anchor_count'] = _count_cpg_positions_per_interval(
+        filtered,
+        cpg_positions_by_chrom,
+    )
+    return filtered.loc[filtered['anchor_count'] > 0].reset_index(drop=True)
+
+
+def _sample_anchor_position_from_interval(
+    chosen_interval: pd.Series,
+    cpg_positions_by_chrom: dict[str, np.ndarray],
+    rng: np.random.RandomState,
+) -> int | None:
+    positions = cpg_positions_by_chrom.get(str(chosen_interval['chrom']))
+    if positions is None or positions.size == 0:
+        return None
+
+    start = int(chosen_interval['start'])
+    end = int(chosen_interval['end'])
+    left = np.searchsorted(positions, start, side='left')
+    right = np.searchsorted(positions, end, side='left')
+    if right <= left:
+        return None
+    return int(positions[int(rng.randint(left, right))])
+
+
+def _place_anchor_random_region(
+    chosen_interval: pd.Series,
+    anchor_pos: int,
+    requested_length: int,
+    rng: np.random.RandomState,
+    cpg_positions_by_chrom: dict[str, np.ndarray],
+    min_cpgs_for_random_regions: int,
+    max_start_attempts: int = 64,
+) -> dict[str, int | str] | None:
+    interval_start = int(chosen_interval['start'])
+    interval_end = int(chosen_interval['end'])
+    requested_length = int(requested_length)
+    anchor_pos = int(anchor_pos)
+    min_cpgs_for_random_regions = max(1, int(min_cpgs_for_random_regions))
+
+    min_start = max(interval_start, anchor_pos - requested_length + 1)
+    max_start = min(interval_end - requested_length, anchor_pos)
+    if max_start < min_start:
+        return None
+
+    if min_cpgs_for_random_regions <= 1:
+        chosen_start = min_start if max_start == min_start else int(
+            rng.randint(min_start, max_start + 1)
+        )
+        return {
+            'chrom': str(chosen_interval['chrom']),
+            'start': chosen_start,
+            'end': chosen_start + requested_length,
+            'length': requested_length,
+        }
+
+    candidate_starts = []
+    for _ in range(max(1, int(max_start_attempts))):
+        if max_start == min_start:
+            candidate_starts.append(min_start)
+        else:
+            candidate_starts.append(int(rng.randint(min_start, max_start + 1)))
+
+    candidate_starts.extend(
+        [
+            min_start,
+            max_start,
+            min(max_start, max(min_start, anchor_pos - requested_length // 2)),
+        ]
+    )
+
+    seen_starts = set()
+    for start in candidate_starts:
+        start = int(start)
+        if start in seen_starts:
+            continue
+        seen_starts.add(start)
+        end = start + requested_length
+        cpg_count = _count_cpg_positions_in_region(
+            str(chosen_interval['chrom']),
+            start,
+            end,
+            cpg_positions_by_chrom,
+        )
+        if cpg_count >= min_cpgs_for_random_regions:
+            return {
+                'chrom': str(chosen_interval['chrom']),
+                'start': start,
+                'end': end,
+                'length': requested_length,
+            }
+
+    return None
+
+def load_pmds_per_sample(samples_info):
+    """
+    Load PMDs (Partially Methylated Domains) for each sample.
+
+    Parameters:
+    samples_info (pd.DataFrame): A DataFrame containing sample information.
+
+    Returns:
+    dict: A dictionary where keys are sample IDs and values are DataFrames of PMDs.
+    """
+
+    pmds_per_sample = {}
+
+    for _, row in samples_info.iterrows():
+        sample_id = row['sample']
+        pmds_file_path = PMD_PATH / sample_id / 'out' / 'hm450k' / 'summary_files' / 'segments_cleaned_PMD.bed'
+        pmds_data = pd.read_csv(
+            pmds_file_path,
+            sep='\t',
+            header=None,
+            names=['chrom', 'start', 'end', 'type'],
+        )
+        pmds_per_sample[sample_id] = pmds_data
+
+    return pmds_per_sample
+
+def _normalize_regions(region_df):
+    if region_df is None or region_df.empty:
+        return pd.DataFrame(columns=['chrom', 'start', 'end', 'length'])
+
+    if 'chrom' in region_df.columns:
+        chrom_col = 'chrom'
+    elif 'chr' in region_df.columns:
+        chrom_col = 'chr'
+    elif "CpG_chrm" in region_df.columns:
+        chrom_col = "CpG_chrm"
+    else:
+        raise ValueError("Region dataframe must contain either a 'chrom' or 'chr' column.")
+
+    normalized = region_df.rename(columns={chrom_col: 'chrom'})[['chrom', 'start', 'end']].copy()
+    normalized['chrom'] = normalized['chrom'].astype(str)
+    normalized['start'] = pd.to_numeric(normalized['start'], errors='coerce')
+    normalized['end'] = pd.to_numeric(normalized['end'], errors='coerce')
+    normalized = normalized.dropna(subset=['start', 'end']).copy()
+    normalized['start'] = normalized['start'].astype(int)
+    normalized['end'] = normalized['end'].astype(int)
+    normalized['length'] = normalized['end'] - normalized['start']
+    return normalized.reset_index(drop=True)
+
+def _merge_intervals(interval_df):
+    intervals = _normalize_regions(interval_df)
+    if intervals.empty:
+        return intervals
+
+    intervals = intervals.sort_values(['chrom', 'start', 'end']).reset_index(drop=True)
+    merged_rows = []
+
+    for chrom, chrom_df in intervals.groupby('chrom', sort=False):
+        current_start = int(chrom_df.iloc[0]['start'])
+        current_end = int(chrom_df.iloc[0]['end'])
+
+        for row in chrom_df.iloc[1:].itertuples(index=False):
+            start = int(row.start)
+            end = int(row.end)
+            if start <= current_end:
+                current_end = max(current_end, end)
+            else:
+                merged_rows.append({'chrom': chrom, 'start': current_start, 'end': current_end})
+                current_start = start
+                current_end = end
+
+        merged_rows.append({'chrom': chrom, 'start': current_start, 'end': current_end})
+
+    merged_df = pd.DataFrame(merged_rows, columns=['chrom', 'start', 'end'])
+    merged_df['length'] = merged_df['end'] - merged_df['start']
+    return merged_df.reset_index(drop=True)
+
+def _load_random_region_reference_data():
+    global _RANDOM_REGION_REFERENCE_CACHE
+
+    if _RANDOM_REGION_REFERENCE_CACHE is None:
+        centromeres = pd.read_csv(
+            CENTROMERE_PATH,
+            sep='\t',
+            header=None,
+            usecols=[0, 1, 2],
+            names=['chrom', 'start', 'end'],
+        )
+        gaps = pd.read_csv(
+            GAP_PATH,
+            sep='\t',
+            usecols=['chrom', 'chromStart', 'chromEnd', 'type'],
+        )
+        telomeres = gaps.loc[
+            gaps['type'].astype(str).eq('telomere'),
+            ['chrom', 'chromStart', 'chromEnd'],
+        ].rename(columns={'chromStart': 'start', 'chromEnd': 'end'})
+        forbidden_regions = _merge_intervals(pd.concat([centromeres, telomeres], ignore_index=True))
+
+        chromosome_sizes = pd.read_csv(
+            HG38_PATH,
+            sep='\t',
+            header=None,
+            names=['chrom', 'size'],
+        )
+        chromosome_sizes['chrom'] = chromosome_sizes['chrom'].astype(str)
+        chromosome_sizes['size'] = pd.to_numeric(chromosome_sizes['size'], errors='coerce')
+        chromosome_sizes = chromosome_sizes.dropna(subset=['size']).copy()
+        chromosome_sizes['size'] = chromosome_sizes['size'].astype(int)
+
+        _RANDOM_REGION_REFERENCE_CACHE = (forbidden_regions, chromosome_sizes)
+
+    return _RANDOM_REGION_REFERENCE_CACHE
+
+def _build_allowed_region_pool(excluded_regions=None, min_length_bp=1):
+    forbidden_regions, chromosome_sizes = _load_random_region_reference_data()
+    excluded = _normalize_regions(excluded_regions)
+    min_length_bp = max(1, int(min_length_bp))
+    if not excluded.empty:
+        forbidden_regions = _merge_intervals(
+            pd.concat(
+                [
+                    forbidden_regions[['chrom', 'start', 'end']],
+                    excluded[['chrom', 'start', 'end']],
+                ],
+                ignore_index=True,
+            )
+        )
+    forbidden_by_chrom = {
+        chrom: chrom_df.reset_index(drop=True)
+        for chrom, chrom_df in forbidden_regions.groupby('chrom', sort=False)
+    }
+
+    allowed_rows = []
+    for row in chromosome_sizes.itertuples(index=False):
+        chrom = str(row.chrom)
+        chrom_size = int(row.size)
+        cursor = 0
+        chrom_forbidden = forbidden_by_chrom.get(chrom)
+
+        if chrom_forbidden is not None and not chrom_forbidden.empty:
+            for interval in chrom_forbidden.itertuples(index=False):
+                start = max(0, int(interval.start))
+                end = min(chrom_size, int(interval.end))
+                if start > cursor:
+                    allowed_rows.append({'chrom': chrom, 'start': cursor, 'end': start})
+                cursor = max(cursor, end)
+
+        if cursor < chrom_size:
+            allowed_rows.append({'chrom': chrom, 'start': cursor, 'end': chrom_size})
+
+    allowed_pool = _normalize_regions(pd.DataFrame(allowed_rows, columns=['chrom', 'start', 'end']))
+    return allowed_pool.loc[allowed_pool['length'] >= min_length_bp].reset_index(drop=True)
+
+def _subtract_interval_from_pool(pool_df, chrom, used_start, used_end):
+    if pool_df.empty:
+        return pool_df.copy()
+
+    kept_rows = []
+    for row in pool_df.itertuples(index=False):
+        if row.chrom != chrom or int(row.end) <= used_start or int(row.start) >= used_end:
+            kept_rows.append({'chrom': row.chrom, 'start': int(row.start), 'end': int(row.end)})
+            continue
+        if int(row.start) < used_start:
+            kept_rows.append({'chrom': row.chrom, 'start': int(row.start), 'end': int(used_start)})
+        if int(row.end) > used_end:
+            kept_rows.append({'chrom': row.chrom, 'start': int(used_end), 'end': int(row.end)})
+
+    return _normalize_regions(pd.DataFrame(kept_rows, columns=['chrom', 'start', 'end']))
+
+def collect_all_pmds(pmds_dict, fuzzy_merge_distance=1_000):
+    """
+    Merge PMDs across samples, allowing nearby regions to collapse together.
+
+    Returns columns:
+    chrom, start, end, length, sample_count, samples
+    """
+    parts = []
+    for sample_id, df in pmds_dict.items():
+        if df is None or df.empty:
+            continue
+
+        part = df[['chrom', 'start', 'end']].copy()
+        part['sample_id'] = sample_id
+        parts.append(part)
+
+    if not parts:
+        return pd.DataFrame(columns=['chrom', 'start', 'end', 'length', 'sample_count', 'samples'])
+
+    all_pmds = (
+        pd.concat(parts, ignore_index=True)
+        .sort_values(['chrom', 'start', 'end'])
+        .reset_index(drop=True)
+    )
+
+    merged_rows = []
+
+    for chrom, chrom_df in all_pmds.groupby('chrom', sort=False):
+        current_start = None
+        current_end = None
+        current_samples = set()
+
+        for row in chrom_df.itertuples(index=False):
+            start = int(row.start)
+            end = int(row.end)
+            sample_id = row.sample_id
+
+            if current_start is None:
+                current_start = start
+                current_end = end
+                current_samples = {sample_id}
+                continue
+
+            if start <= current_end + fuzzy_merge_distance:
+                current_end = max(current_end, end)
+                current_samples.add(sample_id)
+            else:
+                merged_rows.append({
+                    'chrom': chrom,
+                    'start': current_start,
+                    'end': current_end,
+                    'length': current_end - current_start,
+                    'sample_count': len(current_samples),
+                    'samples': sorted(current_samples),
+                })
+                current_start = start
+                current_end = end
+                current_samples = {sample_id}
+
+        merged_rows.append({
+            'chrom': chrom,
+            'start': current_start,
+            'end': current_end,
+            'length': current_end - current_start,
+            'sample_count': len(current_samples),
+            'samples': sorted(current_samples),
+        })
+
+    return pd.DataFrame(merged_rows)
+
+
+def exclude_overlapping_regions(region_df, excluded_regions, proximity_bp=0):
+    """
+    Remove regions that overlap or lie close to excluded regions.
+
+    Parameters
+    ----------
+    region_df : pd.DataFrame
+        Candidate regions to retain.
+    excluded_regions : pd.DataFrame
+        Regions that should be removed from the candidates.
+    proximity_bp : int, default 0
+        Maximum gap size still treated as overlapping.
+
+    Returns
+    -------
+    pd.DataFrame
+        region_df rows that do not overlap excluded_regions.
+    """
+
+    regions = region_df.copy().reset_index(drop=True)
+    if regions.empty:
+        return regions
+
+    excluded = _normalize_regions(excluded_regions)
+    if excluded.empty:
+        return regions
+
+    proximity_bp = max(0, int(proximity_bp))
+    excluded_by_chrom = {
+        str(chrom): chrom_df[['start', 'end']].to_numpy(dtype=int)
+        for chrom, chrom_df in excluded.groupby('chrom', sort=False)
+    }
+
+    keep_mask = np.ones(len(regions), dtype=bool)
+    for row_idx, row in enumerate(regions.itertuples(index=False)):
+        excluded_intervals = excluded_by_chrom.get(str(row.chrom))
+        if excluded_intervals is None or excluded_intervals.size == 0:
+            continue
+
+        start = int(row.start)
+        end = int(row.end)
+        is_near_or_overlapping = (
+            (excluded_intervals[:, 0] <= end + proximity_bp)
+            & (excluded_intervals[:, 1] >= start - proximity_bp)
+        )
+        if np.any(is_near_or_overlapping):
+            keep_mask[row_idx] = False
+
+    return regions.loc[keep_mask].reset_index(drop=True)
+
+def load_cgis(filter_to_cannonical=True):
+    """
+    Load CpG islands (CGIs) data.
+
+    Returns:
+    pd.DataFrame: A DataFrame containing the CGI data.
+    """
+
+    cgi_data = pd.read_csv(
+        CGI_BED,
+        sep='\t',
+        header=None,
+        usecols=[0, 1, 2, 3],
+        names=['chrom', 'start', 'end', 'name'],
+    )
+    cgi_data['length'] = cgi_data['end'] - cgi_data['start']
+
+    if filter_to_cannonical:
+        cgi_data = cgi_data[cgi_data['chrom'].isin(CANNONICAL_CHROMOSOMES)].reset_index(drop=True)
+
+    return cgi_data
+
+def pick_recurrent_pmds(all_pmds):
+    recurrent_pmds = all_pmds.copy()
+
+    if recurrent_pmds.empty:
+        return recurrent_pmds.reset_index(drop=True)
+
+    if "length" not in recurrent_pmds.columns:
+        recurrent_pmds["length"] = (
+            recurrent_pmds["end"] - recurrent_pmds["start"]
+        )
+
+    return (
+        recurrent_pmds
+        .sort_values(
+            ["sample_count", "length"],
+            ascending=[False, False],
+        )
+        .reset_index(drop=True)
+    )
+
+def fit_gamma_length_distribution(reference_regions: pd.DataFrame):
+    """
+    Fit a gamma distribution to observed region lengths.
+
+    Returns a dictionary that can be passed into pick_random_methylation_regions.
+    """
+
+    reference = _normalize_regions(reference_regions)
+    if reference.empty:
+        raise ValueError('reference_regions must contain at least one valid interval.')
+
+    lengths = reference['length'].to_numpy(dtype=float)
+    if np.any(lengths <= 0):
+        raise ValueError('reference_regions must contain positive interval lengths.')
+
+    shape, loc, scale = stats.gamma.fit(lengths, floc=0)
+
+    return {
+        'distribution': 'gamma',
+        'shape': float(shape),
+        'scale': float(scale),
+        'loc': float(loc),
+        'min_length': int(np.floor(lengths.min())),
+        'max_length': int(np.ceil(lengths.max())),
+        'mean_length': float(lengths.mean()),
+        'variance': float(lengths.var(ddof=1)) if len(lengths) > 1 else 0.0,
+        'n_observations': int(len(lengths)),
+    }
+
+def _sample_gamma_lengths(n_regions, length_distribution, rng):
+    if length_distribution.get('distribution') != 'gamma':
+        raise ValueError('length_distribution must come from fit_gamma_length_distribution().')
+
+    sampled = rng.gamma(
+        shape=float(length_distribution['shape']),
+        scale=float(length_distribution['scale']),
+        size=int(n_regions),
+    ) + float(length_distribution.get('loc', 0.0))
+    sampled = np.rint(sampled).astype(int)
+    sampled = np.clip(
+        sampled,
+        int(length_distribution['min_length']),
+        int(length_distribution['max_length']),
+    )
+    sampled[sampled < 1] = 1
+    return sampled
+
+def _gamma_min_realistic_length(length_distribution):
+    if length_distribution.get('distribution') != 'gamma':
+        raise ValueError('length_distribution must come from fit_gamma_length_distribution().')
+
+    min_length = stats.gamma.ppf(
+        0.25,
+        a=float(length_distribution['shape']),
+        loc=float(length_distribution.get('loc', 0.0)),
+        scale=float(length_distribution['scale']),
+    )
+    if np.isnan(min_length):
+        raise ValueError('Could not compute a realistic minimum length from the gamma distribution.')
+    return max(1, int(np.rint(min_length)))
+
+def _choose_pool_interval(candidate_pool, rng, requested_length=None):
+    if candidate_pool.empty:
+        return None
+
+    if requested_length is None:
+        weights = candidate_pool['length'].to_numpy(dtype=float)
+    else:
+        weights = (candidate_pool['length'] - int(requested_length) + 1).to_numpy(dtype=float)
+
+    weights = weights / weights.sum()
+    chosen_idx = int(rng.choice(candidate_pool.index.to_numpy(), p=weights))
+    return candidate_pool.loc[chosen_idx]
+
+def _place_random_region(chosen_interval, rng, requested_length=None):
+    if chosen_interval is None:
+        return None
+
+    interval_length = int(chosen_interval['length'])
+    realized_length = interval_length if requested_length is None else int(requested_length)
+    max_offset = interval_length - realized_length
+    offset = 0 if max_offset == 0 else int(rng.randint(0, max_offset + 1))
+    start = int(chosen_interval['start']) + offset
+    end = start + realized_length
+
+    return {
+        'chrom': str(chosen_interval['chrom']),
+        'start': start,
+        'end': end,
+        'length': realized_length,
+    }
+
+def pick_random_methylation_regions(
+    n_regions,
+    reference_regions: pd.DataFrame,
+    length_distribution,
+    random_seed=RANDOM_SEED,
+    excluded_regions=None,
+    cpg_positions_by_chrom: dict[str, np.ndarray] | None = None,
+    min_cpgs_for_random_regions: int = 1,
+    sample_from_cpg_anchors: bool = False,
+):
+    """
+    Sample random genomic regions one at a time from the remaining allowed pool.
+
+    Regions are drawn from hg38, exclude centromeres and telomeres, can also exclude
+    training-fold PMDs, and do not overlap each other within a sampling call. The
+    sampler prefers same-chromosome full-length fits, then any-chromosome full-length
+    fits, and finally falls back to whole realistic intervals when no full-length fit exists.
+    When sample_from_cpg_anchors=True, Random short/long regions are instead anchored
+    on measured HM450K CpGs within intervals that can support the sampled length.
+    """
+
+    n_regions = int(n_regions)
+    if n_regions <= 0:
+        return pd.DataFrame(columns=['chrom', 'start', 'end', 'length'])
+
+    reference = _normalize_regions(reference_regions)
+    if reference.empty:
+        raise ValueError('reference_regions must contain at least one valid interval.')
+
+    rng = np.random.RandomState(random_seed)
+    chrom_weights = reference['chrom'].value_counts(normalize=True).sort_index()
+    chrom_options = chrom_weights.index.to_numpy(dtype=object)
+    chrom_probabilities = chrom_weights.to_numpy(dtype=float)
+    min_length_bp = _gamma_min_realistic_length(length_distribution)
+    min_cpgs_for_random_regions = max(1, int(min_cpgs_for_random_regions))
+
+    if sample_from_cpg_anchors and cpg_positions_by_chrom is None:
+        raise ValueError('CpG-anchored random sampling requires cpg_positions_by_chrom.')
+
+    allowed_pool = _build_allowed_region_pool(
+        excluded_regions=excluded_regions,
+        min_length_bp=min_length_bp,
+    )
+    if allowed_pool.empty:
+        raise ValueError(
+            'No realistic intervals remained in the allowed pool after excluding forbidden regions '
+            f'and applying min_length_bp={min_length_bp}.'
+        )
+    chromosome_sizes = set(allowed_pool['chrom'])
+    missing_chroms = sorted(set(chrom_options) - chromosome_sizes)
+    if missing_chroms:
+        raise ValueError(f'No chromosome size information was available for: {missing_chroms}')
+
+    random_rows = []
+    failed_regions = []
+
+    for region_index in range(n_regions):
+        placed_region = None
+        failure_context = None
+
+        for attempt_number in range(256):
+            requested_length = int(_sample_gamma_lengths(1, length_distribution, rng)[0])
+            chrom = str(rng.choice(chrom_options, p=chrom_probabilities))
+
+            if sample_from_cpg_anchors:
+                same_chrom_pool = _filter_interval_pool_for_requested_length(
+                    allowed_pool.loc[allowed_pool['chrom'] == chrom].reset_index(drop=True),
+                    requested_length=requested_length,
+                    cpg_positions_by_chrom=cpg_positions_by_chrom,
+                )
+                any_chrom_pool = _filter_interval_pool_for_requested_length(
+                    allowed_pool,
+                    requested_length=requested_length,
+                    cpg_positions_by_chrom=cpg_positions_by_chrom,
+                )
+
+                for candidate_pool in (same_chrom_pool, any_chrom_pool):
+                    if candidate_pool.empty:
+                        continue
+                    chosen_interval = _choose_pool_interval(
+                        candidate_pool,
+                        rng,
+                        requested_length=requested_length,
+                    )
+                    if chosen_interval is None:
+                        continue
+                    anchor_pos = _sample_anchor_position_from_interval(
+                        chosen_interval,
+                        cpg_positions_by_chrom,
+                        rng,
+                    )
+                    if anchor_pos is None:
+                        continue
+                    placed_region = _place_anchor_random_region(
+                        chosen_interval,
+                        anchor_pos=anchor_pos,
+                        requested_length=requested_length,
+                        rng=rng,
+                        cpg_positions_by_chrom=cpg_positions_by_chrom,
+                        min_cpgs_for_random_regions=min_cpgs_for_random_regions,
+                    )
+                    if placed_region is not None:
+                        break
+
+                if placed_region is not None:
+                    break
+                failure_context = {
+                    'region_index': region_index,
+                    'attempt_number': attempt_number,
+                    'chrom': chrom,
+                    'requested_length': requested_length,
+                    'min_cpgs_for_random_regions': min_cpgs_for_random_regions,
+                }
+                continue
+
+            same_chrom_pool = allowed_pool.loc[
+                (allowed_pool['chrom'] == chrom)
+                & (allowed_pool['length'] >= requested_length)
+            ].reset_index(drop=True)
+            any_chrom_pool = allowed_pool.loc[
+                allowed_pool['length'] >= requested_length
+            ].reset_index(drop=True)
+
+            if not same_chrom_pool.empty:
+                chosen_interval = _choose_pool_interval(
+                    same_chrom_pool,
+                    rng,
+                    requested_length=requested_length,
+                )
+                placed_region = _place_random_region(
+                    chosen_interval,
+                    rng,
+                    requested_length=requested_length,
+                )
+            elif not any_chrom_pool.empty:
+                chosen_interval = _choose_pool_interval(
+                    any_chrom_pool,
+                    rng,
+                    requested_length=requested_length,
+                )
+                placed_region = _place_random_region(
+                    chosen_interval,
+                    rng,
+                    requested_length=requested_length,
+                )
+            else:
+                fallback_pool = allowed_pool.loc[
+                    allowed_pool['length'] >= min_length_bp
+                ].reset_index(drop=True)
+                if fallback_pool.empty:
+                    failure_context = {
+                        'region_index': region_index,
+                        'chrom': chrom,
+                        'requested_length': requested_length,
+                        'min_length_bp': min_length_bp,
+                    }
+                    break
+
+                chosen_interval = _choose_pool_interval(fallback_pool, rng)
+                placed_region = _place_random_region(chosen_interval, rng)
+                if placed_region is not None:
+                    break
+
+            if placed_region is not None:
+                break
+
+        if placed_region is None:
+            failed_regions.append(failure_context or {'region_index': region_index})
+            break
+
+        random_rows.append(placed_region)
+        allowed_pool = _subtract_interval_from_pool(
+            allowed_pool,
+            placed_region['chrom'],
+            placed_region['start'],
+            placed_region['end'],
+        )
+        allowed_pool = allowed_pool.loc[allowed_pool['length'] >= min_length_bp].reset_index(drop=True)
+
+    if failed_regions:
+        failure_df = pd.DataFrame(failed_regions)
+        raise ValueError(
+            'Unable to sample enough non-overlapping random regions because no realistic intervals remained in the pool. '
+            f'Remaining failures: {failure_df.to_dict(orient="records")}'
+        )
+
+    random_regions = pd.DataFrame(random_rows, columns=['chrom', 'start', 'end', 'length'])
+    return random_regions.sort_values(['chrom', 'start', 'end']).reset_index(drop=True)
+
+def _sample_region_rows(region_df, n_regions, seed):
+    regions = region_df.copy()
+    if regions.empty:
+        return regions
+    replace = len(regions) < int(n_regions)
+    sampled = regions.sample(n=int(n_regions), replace=replace, random_state=seed).reset_index(drop=True)
+    if {'start', 'end'}.issubset(sampled.columns) and 'length' not in sampled.columns:
+        sampled['length'] = sampled['end'] - sampled['start']
+    return sampled
+
+def pick_features(
+    n_features,
+    training_pmds,
+    cgis,
+    offset=1000,
+    random_seed=42,
+    cpg_positions_by_chrom: dict[str, np.ndarray] | None = None,
+    min_cpgs_for_random_regions: int = 1,
+):
+    """
+    Build the five region sets used in the classification benchmark.
+
+    Parameters
+    ----------
+    n_features : int
+        Number of regions to include in each feature set.
+    training_pmds : pd.DataFrame
+        Fuzzy-merged PMDs from tumor samples in the current training fold.
+    cgis : pd.DataFrame
+        CpG island regions.
+    offset : int, default 1000
+        Offset added to the base seed so each draw is reproducible but distinct.
+    random_seed : int, default 42
+        Base random seed.
+
+    Returns
+    -------
+    dict[str, pd.DataFrame]
+        Named region sets keyed by feature family.
+    """
+
+    rng = np.random.RandomState(random_seed + offset)
+
+    recurrent_pmds = (
+        pick_recurrent_pmds(training_pmds)
+        .head(n_features)
+        .reset_index(drop=True)
+    )
+
+    random_pmds = _sample_region_rows(
+        training_pmds,
+        n_features,
+        seed=int(rng.randint(0, 2**31 - 1)),
+    )
+
+    random_cgis = _sample_region_rows(
+        cgis,
+        n_features,
+        seed=int(rng.randint(0, 2**31 - 1)),
+    )
+
+    pmd_length_distribution = fit_gamma_length_distribution(training_pmds)
+    cgi_length_distribution = fit_gamma_length_distribution(cgis)
+
+    random_long_regions = pick_random_methylation_regions(
+        n_regions=n_features,
+        reference_regions=training_pmds,
+        length_distribution=pmd_length_distribution,
+        random_seed=int(rng.randint(0, 2**31 - 1)),
+        excluded_regions=training_pmds,
+        cpg_positions_by_chrom=cpg_positions_by_chrom,
+        min_cpgs_for_random_regions=min_cpgs_for_random_regions,
+        sample_from_cpg_anchors=True,
+    )
+
+    random_short_regions = pick_random_methylation_regions(
+        n_regions=n_features,
+        reference_regions=cgis,
+        length_distribution=cgi_length_distribution,
+        random_seed=int(rng.randint(0, 2**31 - 1)),
+        excluded_regions=training_pmds,
+        cpg_positions_by_chrom=cpg_positions_by_chrom,
+        min_cpgs_for_random_regions=min_cpgs_for_random_regions,
+        sample_from_cpg_anchors=True,
+    )
+
+    return {
+        "PMD": recurrent_pmds,
+        "Random PMD": random_pmds,
+        "CGI": random_cgis,
+        "Random long": random_long_regions,
+        "Random short": random_short_regions,
+    }
+
+def calculate_region_methylation(sample_ids, regions, methylation_data):
+    """
+    Compute mean methylation for each region in each sample.
+
+    Parameters
+    ----------
+    sample_ids : sequence of str
+        Samples to include as columns in the output.
+    regions : pd.DataFrame
+        Region table with chromosome, start, and end columns.
+    methylation_data : pd.DataFrame
+        CpG coordinate table followed by one methylation column per sample.
+
+    Returns
+    -------
+    pd.DataFrame
+        Region-by-sample matrix of mean methylation values.
+    """
+
+    sample_ids = list(sample_ids)
+    regions = _normalize_regions(regions)
+    if regions.empty or methylation_data.empty:
+        return pd.DataFrame(columns=sample_ids)
+
+    region_means = []
+    for region in regions.itertuples(index=False):
+        region_cpgs = methylation_data.loc[
+            methylation_data['CpG_chrm'].astype(str).eq(str(region.chrom))
+            & (methylation_data['CpG_beg'] < int(region.end))
+            & (methylation_data['CpG_end'] > int(region.start)),
+            sample_ids,
+        ]
+
+        if region_cpgs.empty:
+            mean_values = pd.Series(np.nan, index=sample_ids, dtype=float)
+        else:
+            mean_values = region_cpgs.mean(axis=0)
+
+        region_means.append(mean_values)
+
+    return pd.DataFrame(region_means).reset_index(drop=True)
+
+def get_training_pmds(train_sample_ids, sample_types, pmds_per_sample, label='Tumor'):
+    """
+    Merge PMDs from one label class in the current training fold.
+
+    Parameters
+    ----------
+    train_sample_ids : sequence of str
+        Sample IDs assigned to the training split.
+    sample_types : dict[str, str]
+        Mapping from sample ID to label such as 'Tumor' or 'Normal'.
+    pmds_per_sample : dict[str, pd.DataFrame]
+        PMD calls for each sample.
+    label : str, default 'Tumor'
+        Class label to collect PMDs from within the training split.
+
+    Returns
+    -------
+    pd.DataFrame
+        Fuzzy-merged PMD table for the selected training samples.
+    """
+
+    training_pmd_dict = {
+        sample_id: pmds_per_sample[sample_id]
+        for sample_id in train_sample_ids
+        if sample_types.get(sample_id) == str(label) and sample_id in pmds_per_sample
+    }
+    return collect_all_pmds(training_pmd_dict)
+
+def build_region_feature_matrix(sample_ids, regions, methylation_data):
+    """
+    Convert a region list into a sample-by-feature methylation matrix.
+
+    Parameters
+    ----------
+    sample_ids : sequence of str
+        Samples that should become matrix rows.
+    regions : pd.DataFrame
+        Region table to summarize.
+    methylation_data : pd.DataFrame
+        CpG coordinate table followed by one methylation column per sample.
+
+    Returns
+    -------
+    pd.DataFrame
+        Sample-by-region feature matrix.
+    """
+
+    sample_ids = list(sample_ids)
+    region_matrix = calculate_region_methylation(sample_ids, regions, methylation_data)
+    if region_matrix.empty:
+        return pd.DataFrame(index=sample_ids)
+
+    feature_matrix = region_matrix.T
+    feature_matrix.index = sample_ids
+    feature_matrix.columns = [f'region_{idx}' for idx in range(feature_matrix.shape[1])]
+    return feature_matrix
+
+def score_always_cancer(y_test):
+    """
+    Score a baseline that predicts tumor for every held-out sample.
+
+    Parameters
+    ----------
+    y_test : array-like of int
+        True labels for the held-out samples.
+
+    Returns
+    -------
+    dict
+        Metric dictionary containing balanced accuracy, average precision,
+        macro F1, MCC, and ROC AUC.
+    """
+
+    y_test = np.asarray(y_test)
+    predicted_class = np.ones_like(y_test)
+    predicted_probability = np.ones_like(y_test, dtype=float)
+
+    metrics = _score_predictions(
+        y_test=y_test,
+        predicted_class=predicted_class,
+        predicted_probability=predicted_probability,
+    )
+    return metrics
+
+
+def _score_predictions(y_test, predicted_class, predicted_probability):
+    y_test = np.asarray(y_test)
+    predicted_class = np.asarray(predicted_class)
+    predicted_probability = np.asarray(predicted_probability, dtype=float)
+    metrics = {
+        'balanced_accuracy': balanced_accuracy_score(y_test, predicted_class),
+        'average_precision': average_precision_score(y_test, predicted_probability),
+        'macro_f1': f1_score(y_test, predicted_class, average='macro', zero_division=0),
+        'mcc': matthews_corrcoef(y_test, predicted_class),
+    }
+    metrics['roc_auc'] = (
+        roc_auc_score(y_test, predicted_probability)
+        if np.unique(y_test).size == 2
+        else np.nan
+    )
+    return metrics
+
+def score_feature_set(
+    train_sample_ids,
+    test_sample_ids,
+    y_train,
+    y_test,
+    regions,
+    methylation_data,
+    random_state,
+    rf_n_jobs=1,
+    return_predictions=False,
+):
+    """
+    Fit one random-forest model for a single feature set and score it.
+
+    Returns
+    -------
+    dict | None
+        Metric dictionary containing balanced accuracy, average precision,
+        macro F1, MCC, and ROC AUC, or None when the feature matrix is unusable.
+    """
+
+    X_train = build_region_feature_matrix(train_sample_ids, regions, methylation_data)
+    X_test = build_region_feature_matrix(test_sample_ids, regions, methylation_data)
+    if X_train.empty or X_test.empty:
+        return None
+
+    valid_columns = ~X_train.isna().all(axis=0)
+    X_train = X_train.loc[:, valid_columns]
+    X_test = X_test.loc[:, valid_columns]
+    if X_train.shape[1] == 0:
+        return None
+
+    imputer = SimpleImputer(strategy='mean')
+    X_train = imputer.fit_transform(X_train)
+    X_test = imputer.transform(X_test)
+
+    model = RandomForestClassifier(
+        n_estimators=500,
+        class_weight='balanced',
+        n_jobs=int(rf_n_jobs),
+        random_state=random_state,
+    )
+    model.fit(X_train, y_train)
+
+    predicted_class = model.predict(X_test)
+    predicted_probability = model.predict_proba(X_test)[:, 1]
+
+    metrics = _score_predictions(
+        y_test=y_test,
+        predicted_class=predicted_class,
+        predicted_probability=predicted_probability,
+    )
+    if return_predictions:
+        return metrics, predicted_class, predicted_probability
+    return metrics
+
+
+def _append_fold_prediction_rows(
+    fold_prediction_rows,
+    test_sample_ids,
+    y_test,
+    predicted_class,
+    predicted_probability,
+    *,
+    split,
+    repeat,
+    fold,
+    feature_draw,
+    feature_set,
+    n_features,
+):
+    fold_key = f'repeat_{int(repeat):02d}_fold_{int(fold):02d}_split_{int(split):04d}'
+    prediction_rows = pd.DataFrame({
+        'fold_key': fold_key,
+        'split': int(split),
+        'repeat': int(repeat),
+        'fold': int(fold),
+        'sample_id': pd.Index(test_sample_ids, dtype='object'),
+        'sample_label': np.where(np.asarray(y_test, dtype=int) == 1, 'Tumor', 'Normal'),
+        'y_true': np.asarray(y_test, dtype=int),
+        'feature_draw': int(feature_draw),
+        'feature_set': str(feature_set),
+        'n_features': int(n_features),
+        'y_pred': np.asarray(predicted_class, dtype=int),
+        'y_score': np.asarray(predicted_probability, dtype=float),
+    })
+    prediction_rows['correct'] = prediction_rows['y_true'].eq(prediction_rows['y_pred'])
+    fold_prediction_rows.extend(
+        prediction_rows[
+            [
+                'fold_key',
+                'split',
+                'repeat',
+                'fold',
+                'sample_id',
+                'sample_label',
+                'y_true',
+                'feature_draw',
+                'feature_set',
+                'n_features',
+                'y_pred',
+                'y_score',
+                'correct',
+            ]
+        ].to_dict(orient='records')
+    )
+
+def _append_feature_region_rows(
+    feature_region_rows,
+    regions,
+    split,
+    repeat,
+    fold,
+    feature_draw,
+    feature_set,
+    n_features,
+):
+    """
+    Save the exact regions used for one evaluated feature set.
+    """
+
+    if regions is None:
         return
 
-    cohort_keys = []
-    if not summary.empty:
-        cohort_keys.extend(
-            summary.loc[:, ["case_set", "cohort_id"]]
-            .drop_duplicates()
-            .itertuples(index=False, name=None)
-        )
-    if not fold_metrics.empty:
-        cohort_keys.extend(
-            fold_metrics.loc[:, ["case_set", "cohort_id"]]
-            .drop_duplicates()
-            .itertuples(index=False, name=None)
-        )
-    cohort_keys = list(dict.fromkeys(cohort_keys))
+    normalized_regions = _normalize_regions(regions)
+    if normalized_regions.empty:
+        return
 
-    for case_set, cohort_id in cohort_keys:
-        cohort_summary = summary.loc[
-            summary["case_set"].eq(case_set) & summary["cohort_id"].eq(cohort_id)
-        ].copy()
-        cohort_folds = fold_metrics.loc[
-            fold_metrics["case_set"].eq(case_set)
-            & fold_metrics["cohort_id"].eq(cohort_id)
-        ].copy()
-        task_type = (
-            cohort_summary["task_type"].dropna().iloc[0]
-            if not cohort_summary.empty
-            else cohort_folds["task_type"].dropna().iloc[0]
-        )
-        cohort_label = (
-            cohort_summary["cohort_label"].dropna().iloc[0]
-            if not cohort_summary.empty
-            else cohort_folds["cohort_label"].dropna().iloc[0]
-        )
-        feature_order = expected_feature_order(str(task_type))
-        n_values_for_cohort = sorted(
-            set(
-                cohort_summary.get("n_regions_requested", pd.Series(dtype=float))
-                .dropna()
-                .astype(int)
-                .tolist()
+    region_records = normalized_regions.copy().reset_index(drop=True)
+    region_records['split'] = int(split)
+    region_records['repeat'] = int(repeat)
+    region_records['fold'] = int(fold)
+    region_records['feature_draw'] = int(feature_draw)
+    region_records['feature_set'] = str(feature_set)
+    region_records['n_features'] = int(n_features)
+    region_records['region_index'] = np.arange(len(region_records), dtype=int)
+
+    metadata_columns = [
+        'split',
+        'repeat',
+        'fold',
+        'feature_draw',
+        'feature_set',
+        'n_features',
+        'region_index',
+    ]
+    preferred_region_columns = ['chrom', 'start', 'end', 'length', 'sample_count', 'samples', 'name']
+    region_columns = [column for column in preferred_region_columns if column in region_records.columns]
+
+    feature_region_rows.extend(
+        region_records[metadata_columns + region_columns].to_dict(orient='records')
+    )
+
+def _init_feature_classification_worker(
+    meth_data,
+    sample_types,
+    pmds_per_sample,
+    cgis,
+    feature_counts,
+    n_feature_draws,
+    random_seed,
+    exclude_top_normal_shared_pmds,
+    min_cpgs_for_random_regions,
+):
+    global _FEATURE_CLASSIFICATION_WORKER_STATE
+    cpg_anchor_df = build_measured_cpg_anchor_table(meth_data)
+    _FEATURE_CLASSIFICATION_WORKER_STATE = {
+        'meth_data': meth_data,
+        'sample_types': sample_types,
+        'pmds_per_sample': pmds_per_sample,
+        'cgis': cgis,
+        'cpg_positions_by_chrom': _build_cpg_position_lookup(cpg_anchor_df),
+        'feature_counts': tuple(int(value) for value in feature_counts),
+        'n_feature_draws': int(n_feature_draws),
+        'random_seed': int(random_seed),
+        'exclude_top_normal_shared_pmds': bool(exclude_top_normal_shared_pmds),
+        'min_cpgs_for_random_regions': max(1, int(min_cpgs_for_random_regions)),
+    }
+
+def _run_feature_classification_split(split_job):
+    """
+    Evaluate one cross-validation split for the feature classification benchmark.
+    """
+
+    state = _FEATURE_CLASSIFICATION_WORKER_STATE
+    split_number = int(split_job['split_number'])
+    repeat = int(split_job['repeat'])
+    fold = int(split_job['fold'])
+    train_idx = np.asarray(split_job['train_idx'], dtype=int)
+    test_idx = np.asarray(split_job['test_idx'], dtype=int)
+
+    sample_types = state['sample_types']
+    sample_ids = np.asarray(list(sample_types.keys()))
+    y = np.asarray([1 if sample_types[sample_id] == 'Tumor' else 0 for sample_id in sample_ids])
+    train_sample_ids = sample_ids[train_idx].tolist()
+    test_sample_ids = sample_ids[test_idx].tolist()
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+
+    training_tumor_pmds = get_training_pmds(
+        train_sample_ids,
+        sample_types,
+        state['pmds_per_sample'],
+        label='Tumor',
+    )
+    if training_tumor_pmds.empty:
+        return [], [], []
+
+    training_normal_pmds = get_training_pmds(
+        train_sample_ids,
+        sample_types,
+        state['pmds_per_sample'],
+        label='Normal',
+    )
+    recurrent_normal_regions = pick_recurrent_pmds(training_normal_pmds)
+
+    results = []
+    feature_region_rows = []
+    fold_prediction_rows = []
+    always_cancer_metrics = score_always_cancer(y_test)
+    for n_features in state['feature_counts']:
+        recurrent_training_pmds = training_tumor_pmds
+        if state['exclude_top_normal_shared_pmds'] and not recurrent_normal_regions.empty:
+            excluded_normal_regions = recurrent_normal_regions.head(n_features).reset_index(drop=True)
+            recurrent_training_pmds = exclude_overlapping_regions(
+                training_tumor_pmds,
+                excluded_normal_regions,
+                proximity_bp=1_000,
             )
-            | set(
-                cohort_folds.get("n_regions_requested", pd.Series(dtype=float))
-                .dropna()
-                .astype(int)
-                .tolist()
-            )
+        recurrent_regions = pick_recurrent_pmds(recurrent_training_pmds)
+
+        always_cancer_predicted_class = np.ones_like(y_test, dtype=int)
+        always_cancer_predicted_probability = np.ones_like(y_test, dtype=float)
+        results.append({
+            'split': split_number,
+            'repeat': repeat,
+            'fold': fold,
+            'feature_draw': 0,
+            'feature_set': 'Always cancer',
+            'n_features': n_features,
+            **always_cancer_metrics,
+        })
+        _append_fold_prediction_rows(
+            fold_prediction_rows=fold_prediction_rows,
+            test_sample_ids=test_sample_ids,
+            y_test=y_test,
+            predicted_class=always_cancer_predicted_class,
+            predicted_probability=always_cancer_predicted_probability,
+            split=split_number,
+            repeat=repeat,
+            fold=fold,
+            feature_draw=0,
+            feature_set='Always cancer',
+            n_features=n_features,
         )
 
-        for n_value in n_values_for_cohort:
-            n_dir = f"n_{int(n_value):04d}"
-            n_folds = (
-                cohort_folds.loc[
-                    cohort_folds["n_regions_requested"].astype(int).eq(int(n_value))
-                ].copy()
-                if not cohort_folds.empty
-                else pd.DataFrame()
+        selected_recurrent_regions = recurrent_regions.head(n_features).reset_index(drop=True)
+        if len(selected_recurrent_regions) == n_features:
+            recurrent_seed = state['random_seed'] + split_number * 100_000 + n_features * 100
+            scoring_payload = score_feature_set(
+                train_sample_ids=train_sample_ids,
+                test_sample_ids=test_sample_ids,
+                y_train=y_train,
+                y_test=y_test,
+                regions=selected_recurrent_regions,
+                methylation_data=state['meth_data'],
+                random_state=recurrent_seed,
+                rf_n_jobs=1,
+                return_predictions=True,
+            )
+            if scoring_payload is not None:
+                metrics, predicted_class, predicted_probability = scoring_payload
+                results.append({
+                    'split': split_number,
+                    'repeat': repeat,
+                    'fold': fold,
+                    'feature_draw': 0,
+                    'feature_set': 'PMD',
+                    'n_features': n_features,
+                    **metrics,
+                })
+                _append_feature_region_rows(
+                    feature_region_rows=feature_region_rows,
+                    regions=selected_recurrent_regions,
+                    split=split_number,
+                    repeat=repeat,
+                    fold=fold,
+                    feature_draw=0,
+                    feature_set='PMD',
+                    n_features=n_features,
+                )
+                _append_fold_prediction_rows(
+                    fold_prediction_rows=fold_prediction_rows,
+                    test_sample_ids=test_sample_ids,
+                    y_test=y_test,
+                    predicted_class=predicted_class,
+                    predicted_probability=predicted_probability,
+                    split=split_number,
+                    repeat=repeat,
+                    fold=fold,
+                    feature_draw=0,
+                    feature_set='PMD',
+                    n_features=n_features,
+                )
+
+        for draw in range(state['n_feature_draws']):
+            selection_seed = state['random_seed'] + split_number * 100_000 + n_features * 100 + draw
+            feature_sets = pick_features(
+                n_features=n_features,
+                training_pmds=training_tumor_pmds,
+                cgis=state['cgis'],
+                offset=selection_seed,
+                random_seed=state['random_seed'],
+                cpg_positions_by_chrom=state['cpg_positions_by_chrom'],
+                min_cpgs_for_random_regions=state['min_cpgs_for_random_regions'],
             )
 
-            if not n_folds.empty:
-                ensure_dir(plot_dir / "average_metric_bars" / n_dir)
-                ensure_dir(plot_dir / "cv_score_boxplots" / n_dir)
-                fig, axes = plt.subplots(
-                    1,
-                    len(METRIC_COLS),
-                    figsize=(4.2 * len(METRIC_COLS), 4.5),
-                    sharey=True,
-                )
-                if len(METRIC_COLS) == 1:
-                    axes = [axes]
-                x = np.arange(len(feature_order))
-                for ax, metric in zip(axes, METRIC_COLS):
-                    values = [
-                        n_folds.loc[
-                            n_folds["feature_set"].eq(feature_set), metric
-                        ].mean()
-                        for feature_set in feature_order
-                    ]
-                    colors = [
-                        FEATURE_COLORS.get(feature_set, "#777777")
-                        for feature_set in feature_order
-                    ]
-                    ax.bar(x, values, color=colors, alpha=0.9)
-                    ax.set_xticks(x)
-                    ax.set_xticklabels(feature_order, rotation=25, ha="right")
-                    ax.set_ylim(0, 1.02)
-                    ax.set_title(metric.replace("_", " ").title())
-                    ax.grid(axis="y", alpha=0.25)
-                    ax.set_axisbelow(True)
-                axes[0].set_ylabel("Mean CV score")
-                handles = [
-                    plt.Line2D(
-                        [0], [0], color=FEATURE_COLORS.get(feature_set, "#777777"), lw=6
-                    )
-                    for feature_set in feature_order
-                ]
-                fig.legend(
-                    handles,
-                    feature_order,
-                    loc="upper center",
-                    bbox_to_anchor=(0.5, 0.92),
-                    ncol=len(feature_order),
-                    frameon=False,
-                )
-                fig.suptitle(
-                    f"Average CV metrics by model: {cohort_label} (n={int(n_value)})",
-                    y=0.99,
-                )
-                fig.tight_layout(rect=[0, 0, 1, 0.82])
-                fig.savefig(
-                    plot_dir
-                    / "average_metric_bars"
-                    / n_dir
-                    / f"{safe_name(case_set)}__{safe_name(cohort_id)}__n{int(n_value):04d}__average_metrics.png",
-                    dpi=160,
-                    bbox_inches="tight",
-                    pad_inches=0.25,
-                )
-                plt.close(fig)
-
-                fig, axes = plt.subplots(
-                    1,
-                    len(METRIC_COLS),
-                    figsize=(4.2 * len(METRIC_COLS), 4.5),
-                    sharey=True,
-                )
-                if len(METRIC_COLS) == 1:
-                    axes = [axes]
-                for ax, metric in zip(axes, METRIC_COLS):
-                    data = [
-                        n_folds.loc[n_folds["feature_set"].eq(feature_set), metric]
-                        .dropna()
-                        .to_numpy()
-                        for feature_set in feature_order
-                    ]
-                    positions = np.arange(1, len(feature_order) + 1)
-                    nonempty_positions = [
-                        pos for pos, values in zip(positions, data) if len(values)
-                    ]
-                    nonempty_data = [values for values in data if len(values)]
-                    if nonempty_data:
-                        box = ax.boxplot(
-                            nonempty_data,
-                            positions=nonempty_positions,
-                            widths=0.55,
-                            patch_artist=True,
-                            boxprops={"edgecolor": "dimgray", "linewidth": 1.3},
-                            medianprops={"color": "black", "linewidth": 1.8},
-                            whiskerprops={"color": "dimgray", "linewidth": 1.2},
-                            capprops={"color": "dimgray", "linewidth": 1.2},
-                            flierprops={
-                                "marker": "o",
-                                "markerfacecolor": "gray",
-                                "markeredgecolor": "dimgray",
-                                "alpha": 0.55,
-                                "markersize": 3,
-                            },
-                        )
-                        for patch, pos in zip(box["boxes"], nonempty_positions):
-                            patch.set_facecolor(
-                                FEATURE_COLORS.get(feature_order[pos - 1], "#D0D0D0")
-                            )
-                            patch.set_alpha(0.75)
-                    ax.set_xticks(positions)
-                    ax.set_xticklabels(feature_order, rotation=25, ha="right")
-                    ax.set_ylim(0, 1.02)
-                    ax.set_title(metric.replace("_", " ").title())
-                    ax.grid(axis="y", alpha=0.25)
-                    ax.set_axisbelow(True)
-                axes[0].set_ylabel("Fold CV score")
-                fig.suptitle(
-                    f"Fold-level CV scores by model: {cohort_label} (n={int(n_value)})",
-                    y=0.98,
-                )
-                fig.tight_layout(rect=[0, 0, 1, 0.88])
-                fig.savefig(
-                    plot_dir
-                    / "cv_score_boxplots"
-                    / n_dir
-                    / f"{safe_name(case_set)}__{safe_name(cohort_id)}__n{int(n_value):04d}__cv_scores.png",
-                    dpi=160,
-                    bbox_inches="tight",
-                    pad_inches=0.25,
-                )
-                plt.close(fig)
-
-        if not cohort_summary.empty:
-            n_values = sorted(cohort_summary["n_regions_requested"].dropna().unique())
-            for metric in METRIC_COLS:
-                metric_col = f"{metric}_mean"
-                if metric_col not in cohort_summary.columns:
+            for feature_set_name, regions in feature_sets.items():
+                if feature_set_name == 'PMD' or len(regions) < n_features:
                     continue
-                fig, ax = plt.subplots(figsize=(7, 4.5))
-                for feature_set in feature_order:
-                    feature_df = cohort_summary.loc[
-                        cohort_summary["feature_set"].eq(feature_set)
-                    ].sort_values("n_regions_requested")
-                    if feature_df.empty:
-                        y_values = [np.nan] * len(n_values)
-                        x_values = n_values
-                    else:
-                        mapped = feature_df.set_index("n_regions_requested")[metric_col]
-                        x_values = n_values
-                        y_values = [mapped.get(n_value, np.nan) for n_value in n_values]
-                    ax.plot(
-                        x_values,
-                        y_values,
-                        marker="o",
-                        linewidth=1.6,
-                        label=feature_set,
-                        color=FEATURE_COLORS.get(feature_set),
-                    )
-                ax.set_xscale("log")
-                ax.set_ylim(0, 1.02)
-                ax.set_xlabel("Number of regions")
-                ax.set_ylabel(metric.replace("_", " ").title())
-                ax.set_title(
-                    f"{metric.replace('_', ' ').title()} by region count: {cohort_label}",
-                    pad=14,
-                )
-                ax.legend(fontsize=8, frameon=False)
-                ax.grid(axis="y", alpha=0.25)
-                fig.tight_layout()
-                fig.savefig(
-                    plot_dir
-                    / "metric_lines"
-                    / f"{safe_name(case_set)}__{safe_name(cohort_id)}__{metric}_line.png",
-                    dpi=160,
-                    bbox_inches="tight",
-                    pad_inches=0.25,
-                )
-                plt.close(fig)
 
-        if confusion.empty:
-            continue
-        cohort_confusion = confusion.loc[
-            confusion["case_set"].eq(case_set) & confusion["cohort_id"].eq(cohort_id)
-        ].copy()
-        for n_value in sorted(
-            cohort_confusion["n_regions_requested"].dropna().astype(int).unique()
-        ):
-            n_dir = f"n_{int(n_value):04d}"
-            ensure_dir(plot_dir / "confusion_matrices" / n_dir)
-            n_confusion = cohort_confusion.loc[
-                cohort_confusion["n_regions_requested"].astype(int).eq(int(n_value))
-            ].copy()
-            for feature_set in feature_order:
-                feature_confusion = n_confusion.loc[
-                    n_confusion["feature_set"].eq(feature_set)
-                ].copy()
-                if feature_confusion.empty:
+                scoring_payload = score_feature_set(
+                    train_sample_ids=train_sample_ids,
+                    test_sample_ids=test_sample_ids,
+                    y_train=y_train,
+                    y_test=y_test,
+                    regions=regions,
+                    methylation_data=state['meth_data'],
+                    random_state=selection_seed,
+                    rf_n_jobs=1,
+                    return_predictions=True,
+                )
+                if scoring_payload is None:
                     continue
-                pivot = feature_confusion.pivot_table(
-                    index="true_label",
-                    columns="predicted_label",
-                    values="count",
-                    aggfunc="sum",
-                    fill_value=0,
+                metrics, predicted_class, predicted_probability = scoring_payload
+
+                results.append({
+                    'split': split_number,
+                    'repeat': repeat,
+                    'fold': fold,
+                    'feature_draw': draw,
+                    'feature_set': feature_set_name,
+                    'n_features': n_features,
+                    **metrics,
+                })
+                _append_feature_region_rows(
+                    feature_region_rows=feature_region_rows,
+                    regions=regions,
+                    split=split_number,
+                    repeat=repeat,
+                    fold=fold,
+                    feature_draw=draw,
+                    feature_set=feature_set_name,
+                    n_features=n_features,
                 )
-                pivot = pivot.sort_index().sort_index(axis=1)
-                normalized = pivot.div(
-                    pivot.sum(axis=1).replace(0, np.nan), axis=0
-                ).fillna(0)
-                fig, ax = plt.subplots(
-                    figsize=(
-                        1.2 * len(normalized.columns) + 2,
-                        1.0 * len(normalized.index) + 2,
-                    )
+                _append_fold_prediction_rows(
+                    fold_prediction_rows=fold_prediction_rows,
+                    test_sample_ids=test_sample_ids,
+                    y_test=y_test,
+                    predicted_class=predicted_class,
+                    predicted_probability=predicted_probability,
+                    split=split_number,
+                    repeat=repeat,
+                    fold=fold,
+                    feature_draw=draw,
+                    feature_set=feature_set_name,
+                    n_features=n_features,
                 )
-                im = ax.imshow(normalized.to_numpy(), cmap="Blues", vmin=0, vmax=1)
-                ax.set_xticks(range(len(normalized.columns)))
-                ax.set_xticklabels(normalized.columns, rotation=90)
-                ax.set_yticks(range(len(normalized.index)))
-                ax.set_yticklabels(normalized.index)
-                ax.set_xlabel("Predicted label")
-                ax.set_ylabel("True label")
-                ax.set_title(
-                    f"Normalized confusion matrix: {feature_set}\n{cohort_label} (n={int(n_value)})",
-                    pad=14,
-                )
-                for i in range(normalized.shape[0]):
-                    for j in range(normalized.shape[1]):
-                        value = normalized.iat[i, j]
-                        ax.text(
-                            j,
-                            i,
-                            f"{value:.2f}",
-                            ha="center",
-                            va="center",
-                            color="black" if value < 0.65 else "white",
-                            fontsize=9,
-                        )
-                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                fig.tight_layout()
-                fig.savefig(
-                    plot_dir
-                    / "confusion_matrices"
-                    / n_dir
-                    / f"{safe_name(case_set)}__{safe_name(cohort_id)}__n{int(n_value):04d}__{safe_name(feature_set)}__confusion.png",
-                    dpi=160,
-                    bbox_inches="tight",
-                    pad_inches=0.25,
-                )
-                plt.close(fig)
+
+    return results, feature_region_rows, fold_prediction_rows
+
+def _feature_classification_process_worker(
+    split_jobs,
+    result_queue,
+    meth_data,
+    sample_types,
+    pmds_per_sample,
+    cgis,
+    feature_counts,
+    n_feature_draws,
+    random_seed,
+    exclude_top_normal_shared_pmds,
+    min_cpgs_for_random_regions,
+):
+    """
+    Run a chunk of CV splits inside one forked worker process.
+    """
+
+    _init_feature_classification_worker(
+        meth_data=meth_data,
+        sample_types=sample_types,
+        pmds_per_sample=pmds_per_sample,
+        cgis=cgis,
+        feature_counts=feature_counts,
+        n_feature_draws=n_feature_draws,
+        random_seed=random_seed,
+        exclude_top_normal_shared_pmds=exclude_top_normal_shared_pmds,
+        min_cpgs_for_random_regions=min_cpgs_for_random_regions,
+    )
+
+    for split_job in split_jobs:
+        result_queue.put(_run_feature_classification_split(split_job))
+
+    result_queue.put(None)
+
+def run_feature_classification(
+    meth_data,
+    sample_types,
+    pmds_per_sample,
+    cgis,
+    feature_counts,
+    n_splits=5,
+    n_repeats=5,
+    n_feature_draws=10,
+    random_seed=42,
+    max_split_workers=None,
+    return_fold_predictions=False,
+    exclude_top_normal_shared_pmds=False,
+    min_cpgs_for_random_regions=1,
+):
+    """
+    Benchmark region-derived feature sets with repeated stratified CV.
+
+    Parameters
+    ----------
+    meth_data : pd.DataFrame
+        CpG coordinate table followed by one methylation column per sample.
+    sample_types : dict[str, str]
+        Mapping from sample ID to class label. 'Tumor' is encoded as 1 and
+        all other labels are encoded as 0.
+    pmds_per_sample : dict[str, pd.DataFrame]
+        Per-sample PMD calls.
+    cgis : pd.DataFrame
+        CpG island region table.
+    feature_counts : sequence of int
+        Numbers of regions to evaluate for each feature family.
+    n_splits : int, default 5
+        Stratified folds per repeat.
+    n_repeats : int, default 5
+        Number of repeated CV rounds.
+    n_feature_draws : int, default 10
+        Independent redraws of the stochastic feature sets for each fold and
+        feature count. Deterministic recurrent PMDs and the always-cancer
+        baseline are evaluated once per split.
+    random_seed : int, default 42
+        Base seed used for CV splitting and feature selection.
+    max_split_workers : int | None, default None
+        Number of multiprocessing workers used across CV splits. When None,
+        use the notebook-level MAX_SPLIT_WORKERS setting.
+    exclude_top_normal_shared_pmds : bool, default False
+        When True, remove tumor training PMDs that overlap the top n shared
+        normal PMDs in the same fold before ranking recurrent tumor PMDs for
+        each feature count n.
+    min_cpgs_for_random_regions : int, default 1
+        Minimum measured HM450K CpGs that must fall inside each anchored
+        Random short / Random long region.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame] | tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+        Classification results plus the exact regions used for each evaluated
+        genomic feature set, and optionally one prediction row per held-out
+        sample / feature-set evaluation.
+    """
+
+    sample_ids = np.asarray(list(sample_types.keys()))
+    y = np.asarray([1 if sample_types[sample_id] == 'Tumor' else 0 for sample_id in sample_ids])
+
+    cv = RepeatedStratifiedKFold(
+        n_splits=n_splits,
+        n_repeats=n_repeats,
+        random_state=random_seed,
+    )
+
+    split_jobs = []
+    for split_number, (train_idx, test_idx) in enumerate(cv.split(sample_ids, y)):
+        split_jobs.append({
+            'split_number': int(split_number),
+            'repeat': int(split_number // n_splits),
+            'fold': int(split_number % n_splits),
+            'train_idx': np.asarray(train_idx, dtype=int),
+            'test_idx': np.asarray(test_idx, dtype=int),
+        })
+
+    if max_split_workers is None:
+        max_split_workers = MAX_SPLIT_WORKERS
+    max_split_workers = max(1, int(max_split_workers))
+
+    results = []
+    feature_region_rows = []
+    fold_prediction_rows = []
+    if max_split_workers == 1:
+        _init_feature_classification_worker(
+            meth_data=meth_data,
+            sample_types=sample_types,
+            pmds_per_sample=pmds_per_sample,
+            cgis=cgis,
+            feature_counts=feature_counts,
+            n_feature_draws=n_feature_draws,
+            random_seed=random_seed,
+            exclude_top_normal_shared_pmds=exclude_top_normal_shared_pmds,
+            min_cpgs_for_random_regions=min_cpgs_for_random_regions,
+        )
+        split_iterator = tqdm(split_jobs, total=len(split_jobs), desc='CV splits')
+        for split_job in split_iterator:
+            split_results, split_feature_regions, split_fold_predictions = _run_feature_classification_split(split_job)
+            results.extend(split_results)
+            feature_region_rows.extend(split_feature_regions)
+            fold_prediction_rows.extend(split_fold_predictions)
+    else:
+        worker_count = min(max_split_workers, len(split_jobs))
+        ctx = mp.get_context('fork')
+        result_queue = ctx.Queue()
+        split_job_chunks = [
+            split_jobs[worker_index::worker_count]
+            for worker_index in range(worker_count)
+        ]
+        processes = []
+        for split_job_chunk in split_job_chunks:
+            process = ctx.Process(
+                target=_feature_classification_process_worker,
+                args=(
+                    split_job_chunk,
+                    result_queue,
+                    meth_data,
+                    sample_types,
+                    pmds_per_sample,
+                    cgis,
+                    feature_counts,
+                    n_feature_draws,
+                    random_seed,
+                    exclude_top_normal_shared_pmds,
+                    min_cpgs_for_random_regions,
+                ),
+            )
+            process.start()
+            processes.append(process)
+
+        finished_workers = 0
+        progress_bar = tqdm(total=len(split_jobs), desc='CV splits')
+        try:
+            while finished_workers < worker_count:
+                payload = result_queue.get()
+                if payload is None:
+                    finished_workers += 1
+                    continue
+
+                split_results, split_feature_regions, split_fold_predictions = payload
+                results.extend(split_results)
+                feature_region_rows.extend(split_feature_regions)
+                fold_prediction_rows.extend(split_fold_predictions)
+                progress_bar.update(1)
+        finally:
+            progress_bar.close()
+            for process in processes:
+                process.join()
+
+    results_df = pd.DataFrame(results)
+    feature_region_columns = [
+        'split',
+        'repeat',
+        'fold',
+        'feature_draw',
+        'feature_set',
+        'n_features',
+        'region_index',
+        'chrom',
+        'start',
+        'end',
+        'length',
+        'sample_count',
+        'samples',
+        'name',
+    ]
+    feature_regions_df = pd.DataFrame(feature_region_rows)
+    if feature_regions_df.empty:
+        feature_regions_df = pd.DataFrame(columns=feature_region_columns)
+    else:
+        available_columns = [column for column in feature_region_columns if column in feature_regions_df.columns]
+        feature_regions_df = feature_regions_df[available_columns].copy()
+
+    fold_prediction_columns = [
+        'fold_key',
+        'split',
+        'repeat',
+        'fold',
+        'sample_id',
+        'sample_label',
+        'y_true',
+        'feature_draw',
+        'feature_set',
+        'n_features',
+        'y_pred',
+        'y_score',
+        'correct',
+    ]
+    fold_predictions_df = pd.DataFrame(fold_prediction_rows)
+    if fold_predictions_df.empty:
+        fold_predictions_df = pd.DataFrame(columns=fold_prediction_columns)
+    else:
+        fold_predictions_df = (
+            fold_predictions_df[fold_prediction_columns]
+            .sort_values(['n_features', 'split', 'sample_id', 'feature_draw', 'feature_set'])
+            .reset_index(drop=True)
+        )
+
+    if return_fold_predictions:
+        return results_df, feature_regions_df, fold_predictions_df
+    return results_df, feature_regions_df
+
+def summarize_classification_results(results, metrics=None):
+    """
+    Aggregate classification scores by feature set and feature count.
+
+    Parameters
+    ----------
+    results : pd.DataFrame
+        Output from run_feature_classification.
+    metrics : sequence of str, optional
+        Metrics to summarize. Defaults to the standard classifier metrics.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-format summary with mean, standard deviation, and standard
+        error for each metric.
+    """
+
+    if metrics is None:
+        metrics = ['balanced_accuracy', 'average_precision', 'macro_f1', 'mcc', 'roc_auc']
+
+    if results.empty:
+        return pd.DataFrame(
+            columns=['feature_set', 'n_features', 'metric', 'mean', 'std', 'n_runs', 'sem']
+        )
+
+    available_metrics = [metric for metric in metrics if metric in results.columns]
+    long_results = results[
+        ['feature_set', 'n_features', *available_metrics]
+    ].melt(
+        id_vars=['feature_set', 'n_features'],
+        value_vars=available_metrics,
+        var_name='metric',
+        value_name='score',
+    )
+
+    summary = (
+        long_results
+        .groupby(['feature_set', 'n_features', 'metric'], as_index=False)['score']
+        .agg(['mean', 'std', 'count'])
+        .reset_index()
+        .rename(columns={'count': 'n_runs'})
+    )
+    summary['sem'] = summary['std'].fillna(0.0) / np.sqrt(summary['n_runs'].clip(lower=1))
+    return summary
+
+def _default_feature_set_labels():
+    return {
+        'PMD': 'Recurrent PMDs',
+        'Random PMD': 'Random PMDs',
+        'CGI': 'Random CGIs',
+        'Random long': 'Random long',
+        'Random short': 'Random short',
+        'Always cancer': 'Always cancer',
+    }
+
+def plot_classification_results(
+    results,
+    metrics=None,
+    feature_set_order=None,
+    palette=None,
+    feature_set_labels=None,
+    x_log_scale=False,
+    subplot_title_suffix=None,
+    figure_title=None,
+    title_size=18,
+    label_size=14,
+    tick_size=11,
+    figure_title_size=16,
+    legend_font_size=None,
+):
+    """
+    Plot classifier performance as a function of feature-set size.
+
+    Parameters
+    ----------
+    results : pd.DataFrame
+        Output from run_feature_classification.
+    metrics : sequence of str, optional
+        Metrics to display. Defaults to the standard classifier metrics.
+    feature_set_order : sequence of str, optional
+        Plot order for feature families.
+    palette : dict[str, str], optional
+        Colors for each feature family.
+    feature_set_labels : dict[str, str], optional
+        Display labels for each feature family.
+    x_log_scale : bool, default False
+        Whether to use a logarithmic x-axis for the feature-count values.
+    subplot_title_suffix : str | None, optional
+        Optional suffix appended to each metric subplot title.
+    figure_title : str | None, optional
+        Optional overall figure title. Defaults to the standard classifier title.
+
+    Returns
+    -------
+    pd.DataFrame
+        Summary table used for plotting.
+    """
+
+    if metrics is None:
+        metrics = ['balanced_accuracy', 'average_precision', 'macro_f1', 'mcc', 'roc_auc']
+
+    if feature_set_order is None:
+        feature_set_order = ['PMD', 'Random PMD', 'CGI', 'Random long', 'Random short', 'Always cancer']
+
+    if palette is None:
+        palette = {
+            'PMD': '#0b5394',
+            'Random PMD': '#3d85c6',
+            'CGI': '#38761d',
+            'Random long': '#9c6ade',
+            'Random short': '#e69138',
+            'Always cancer': '#b7b7b7',
+        }
+
+    if feature_set_labels is None:
+        feature_set_labels = _default_feature_set_labels()
+
+    summary = summarize_classification_results(results, metrics=metrics)
+    if summary.empty:
+        raise ValueError('results is empty. Run run_feature_classification() before plotting.')
+
+    metric_titles = {
+        'balanced_accuracy': 'Balanced accuracy',
+        'average_precision': 'Average precision',
+        'macro_f1': 'Macro F1 score',
+        'mcc': 'Matthews correlation coefficient',
+        'roc_auc': 'ROC AUC',
+    }
+
+    plotted_metrics = [metric for metric in metrics if metric in summary['metric'].unique()]
+    n_cols = 2
+    n_rows = int(np.ceil(len(plotted_metrics) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 4 * n_rows), sharex=True)
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, metric in zip(axes, plotted_metrics):
+        metric_summary = summary.loc[summary['metric'] == metric].copy()
+
+        for feature_set in feature_set_order:
+            feature_df = metric_summary.loc[
+                metric_summary['feature_set'] == feature_set
+            ].sort_values('n_features')
+            if feature_df.empty:
+                continue
+
+            x = feature_df['n_features'].to_numpy(dtype=float)
+            y = feature_df['mean'].to_numpy(dtype=float)
+            sem = feature_df['sem'].fillna(0.0).to_numpy(dtype=float)
+            color = palette.get(feature_set)
+
+            ax.plot(
+                x,
+                y,
+                marker='o',
+                linewidth=2,
+                color=color,
+                label=feature_set_labels.get(feature_set, feature_set),
+            )
+            ax.fill_between(x, y - sem, y + sem, color=color, alpha=0.15)
+
+        metric_title = metric_titles.get(metric, metric.replace('_', ' ').title())
+        if subplot_title_suffix:
+            metric_title = f'{metric_title} - {subplot_title_suffix}'
+        ax.set_title(metric_title, fontsize=title_size)
+        ax.set_xlabel('Number of regions', fontsize=label_size)
+        ax.set_ylabel('Score', fontsize=label_size)
+        ax.tick_params(axis='x', labelbottom=True, labelsize=tick_size)
+        ax.tick_params(axis='y', labelsize=tick_size)
+        if x_log_scale:
+            ax.set_xscale('log')
+        if metric == 'mcc':
+            ax.set_ylim(-1.05, 1.05)
+        else:
+            ax.set_ylim(-0.05, 1.05)
+        ax.grid(True, alpha=0.25)
+
+    for ax in axes[len(plotted_metrics):]:
+        ax.axis('off')
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    unique_labels = dict(zip(labels, handles))
+    if figure_title is None:
+        figure_title = 'Classification performance across feature-set sizes'
+    fig.legend(
+        unique_labels.values(),
+        unique_labels.keys(),
+        loc='upper center',
+        bbox_to_anchor=(0.5, 0.955),
+        ncol=min(len(unique_labels), 3),
+        frameon=False,
+        prop={'size': legend_font_size or tick_size},
+    )
+    fig.suptitle(figure_title, y=0.99, fontsize=figure_title_size)
+    fig.tight_layout(rect=[0, 0, 1, 0.9])
+    plt.show()
+
+    return summary
+
+def plot_classification_box_results(
+    results,
+    n_features=5,
+    metrics=None,
+    feature_set_order=None,
+    palette=None,
+    feature_set_labels=None,
+    subplot_title_suffix=None,
+    figure_title=None,
+    title_size=18,
+    label_size=14,
+    tick_size=11,
+    figure_title_size=16,
+):
+    """
+    Plot per-run score distributions for a single feature-set size with box-and-whisker plots.
+
+    Parameters
+    ----------
+    results : pd.DataFrame
+        Output from run_feature_classification.
+    n_features : int, default 5
+        Feature-set size to display.
+    metrics : sequence of str, optional
+        Metrics to display. Defaults to the standard classifier metrics.
+    feature_set_order : sequence of str, optional
+        Plot order for feature families.
+    palette : dict[str, str], optional
+        Colors for each feature family.
+    feature_set_labels : dict[str, str], optional
+        Display labels for each feature family.
+    subplot_title_suffix : str | None, optional
+        Optional suffix appended to each metric subplot title.
+    figure_title : str | None, optional
+        Optional overall figure title. Defaults to the standard classifier title.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-format table used for plotting.
+    """
+
+    if metrics is None:
+        metrics = ['balanced_accuracy', 'average_precision', 'macro_f1', 'mcc', 'roc_auc']
+
+    if feature_set_order is None:
+        feature_set_order = ['PMD', 'Random PMD', 'CGI', 'Random long', 'Random short', 'Always cancer']
+
+    if palette is None:
+        palette = {
+            'PMD': '#0b5394',
+            'Random PMD': '#3d85c6',
+            'CGI': '#38761d',
+            'Random long': '#9c6ade',
+            'Random short': '#e69138',
+            'Always cancer': '#b7b7b7',
+        }
+
+    if feature_set_labels is None:
+        feature_set_labels = _default_feature_set_labels()
+
+    if results.empty:
+        raise ValueError('results is empty. Run run_feature_classification() before plotting.')
+
+    available_metrics = [metric for metric in metrics if metric in results.columns]
+    box_data = results.loc[
+        results['n_features'] == int(n_features),
+        ['feature_set', 'n_features', *available_metrics],
+    ].copy()
+    if box_data.empty:
+        raise ValueError(f'No results were found for n_features={int(n_features)}.')
+
+    box_long = box_data.melt(
+        id_vars=['feature_set', 'n_features'],
+        value_vars=available_metrics,
+        var_name='metric',
+        value_name='score',
+    )
+    box_long['feature_set'] = pd.Categorical(
+        box_long['feature_set'],
+        categories=feature_set_order,
+        ordered=True,
+    )
+    display_feature_set_order = [
+        feature_set_labels.get(feature_set, feature_set)
+        for feature_set in feature_set_order
+    ]
+    display_palette = {
+        feature_set_labels.get(feature_set, feature_set): color
+        for feature_set, color in palette.items()
+    }
+    box_long['display_feature_set'] = box_long['feature_set'].map(
+        lambda feature_set: feature_set_labels.get(feature_set, feature_set)
+    )
+    box_long['display_feature_set'] = pd.Categorical(
+        box_long['display_feature_set'],
+        categories=display_feature_set_order,
+        ordered=True,
+    )
+    box_long = box_long.sort_values(['metric', 'feature_set']).reset_index(drop=True)
+
+    metric_titles = {
+        'balanced_accuracy': 'Balanced accuracy',
+        'average_precision': 'Average precision',
+        'macro_f1': 'Macro F1 score',
+        'mcc': 'Matthews correlation coefficient',
+        'roc_auc': 'ROC AUC',
+    }
+
+    plotted_metrics = [metric for metric in metrics if metric in box_long['metric'].unique()]
+    n_cols = 2
+    n_rows = int(np.ceil(len(plotted_metrics) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 4 * n_rows), sharey=False)
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, metric in zip(axes, plotted_metrics):
+        metric_df = box_long.loc[box_long['metric'] == metric].copy()
+        sns.boxplot(
+            data=metric_df,
+            x='display_feature_set',
+            y='score',
+            hue='display_feature_set',
+            order=display_feature_set_order,
+            palette=display_palette,
+            dodge=False,
+            saturation=1,
+            fliersize=0,
+            linewidth=1,
+            ax=ax,
+        )
+        legend = ax.get_legend()
+        if legend is not None:
+            legend.remove()
+        sns.stripplot(
+            data=metric_df,
+            x='display_feature_set',
+            y='score',
+            order=display_feature_set_order,
+            color='black',
+            alpha=0.45,
+            size=3,
+            jitter=0.15,
+            ax=ax,
+        )
+        metric_title = metric_titles.get(metric, metric.replace('_', ' ').title())
+        if subplot_title_suffix:
+            metric_title = f'{metric_title} - {subplot_title_suffix}'
+        ax.set_title(metric_title, fontsize=title_size)
+        ax.set_xlabel('Feature set', fontsize=label_size)
+        ax.set_ylabel('Score', fontsize=label_size)
+        ax.tick_params(axis='x', rotation=25, labelsize=tick_size)
+        ax.tick_params(axis='y', labelsize=tick_size)
+        if metric == 'mcc':
+            ax.set_ylim(-1.05, 1.05)
+        else:
+            ax.set_ylim(-0.05, 1.05)
+        ax.grid(True, axis='y', alpha=0.25)
+
+    for ax in axes[len(plotted_metrics):]:
+        ax.axis('off')
+
+    if figure_title is None:
+        figure_title = f'Per-run classification scores for {int(n_features)} regions'
+    fig.suptitle(figure_title, y=1.02, fontsize=figure_title_size)
+    fig.tight_layout()
+    plt.show()
+
+    return box_long
+
+def plot_sampled_feature_length_distributions(
+    sampled_feature_regions,
+    n_features=None,
+    feature_set_order=None,
+    palette=None,
+    feature_set_labels=None,
+    bins=30,
+):
+    """
+    Plot the region-length distributions of the feature sets actually used by the classifier.
+
+    Parameters
+    ----------
+    sampled_feature_regions : pd.DataFrame
+        Region table returned by run_feature_classification.
+    n_features : int | None, default None
+        Feature-set size to display. When None, combine sampled regions across
+        all available feature-set sizes.
+    feature_set_order : sequence of str, optional
+        Plot order for feature families with genomic intervals.
+    palette : dict[str, str], optional
+        Colors for each feature family.
+    feature_set_labels : dict[str, str], optional
+        Display labels for each feature family.
+    bins : int, default 30
+        Number of histogram bins.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-format table used for plotting.
+    """
+
+    if feature_set_order is None:
+        feature_set_order = ['PMD', 'Random PMD', 'CGI', 'Random long', 'Random short']
+
+    if palette is None:
+        palette = {
+            'PMD': '#0b5394',
+            'Random PMD': '#3d85c6',
+            'CGI': '#38761d',
+            'Random long': '#9c6ade',
+            'Random short': '#e69138',
+        }
+
+    if feature_set_labels is None:
+        feature_set_labels = _default_feature_set_labels()
+
+    if sampled_feature_regions.empty:
+        raise ValueError(
+            'sampled_feature_regions is empty. Run run_feature_classification() before plotting.'
+        )
+
+    if n_features is None:
+        plot_data = sampled_feature_regions.loc[
+            :,
+            ['feature_set', 'n_features', 'length'],
+        ].copy()
+        title_suffix = 'all feature-set sizes'
+    else:
+        plot_data = sampled_feature_regions.loc[
+            sampled_feature_regions['n_features'] == int(n_features),
+            ['feature_set', 'n_features', 'length'],
+        ].copy()
+        title_suffix = f'{int(n_features)}-feature sets'
+
+    if plot_data.empty:
+        if n_features is None:
+            raise ValueError('No sampled feature regions were found.')
+        raise ValueError(f'No sampled feature regions were found for n_features={int(n_features)}.')
+
+    plot_data = plot_data.loc[
+        plot_data['feature_set'].isin(feature_set_order)
+    ].copy()
+    display_feature_set_order = [
+        feature_set_labels.get(feature_set, feature_set)
+        for feature_set in feature_set_order
+    ]
+    display_palette = {
+        feature_set_labels.get(feature_set, feature_set): color
+        for feature_set, color in palette.items()
+    }
+    plot_data['feature_set'] = pd.Categorical(
+        plot_data['feature_set'],
+        categories=feature_set_order,
+        ordered=True,
+    )
+    plot_data['display_feature_set'] = plot_data['feature_set'].map(
+        lambda feature_set: feature_set_labels.get(feature_set, feature_set)
+    )
+    plot_data['display_feature_set'] = pd.Categorical(
+        plot_data['display_feature_set'],
+        categories=display_feature_set_order,
+        ordered=True,
+    )
+    plot_data = plot_data.sort_values(['feature_set', 'length']).reset_index(drop=True)
+
+    plotted_feature_sets = [
+        feature_set
+        for feature_set in feature_set_order
+        if feature_set in set(plot_data['feature_set'].astype(str))
+    ]
+    n_cols = 2
+    n_rows = int(np.ceil(len(plotted_feature_sets) / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(6 * n_cols, 3.8 * n_rows),
+        sharex=False,
+        sharey=False,
+    )
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, feature_set in zip(axes, plotted_feature_sets):
+        display_feature_set = feature_set_labels.get(feature_set, feature_set)
+        feature_df = plot_data.loc[
+            plot_data['feature_set'] == feature_set,
+            ['length'],
+        ].copy()
+        sns.histplot(
+            data=feature_df,
+            x='length',
+            bins=int(bins),
+            color=display_palette.get(display_feature_set),
+            element='bars',
+            alpha=0.55,
+            stat='density',
+            ax=ax,
+        )
+        ax.set_xscale('log')
+        ax.set_title(display_feature_set)
+        ax.set_xlabel('Region length (bp)')
+        ax.set_ylabel('Density')
+        ax.grid(True, axis='y', alpha=0.25)
+
+    for ax in axes[len(plotted_feature_sets):]:
+        ax.axis('off')
+
+    fig.suptitle(f'Sampled region lengths for {title_suffix}', y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+    return plot_data
+
+
+__all__ = [
+    'MAX_SPLIT_WORKERS',
+    'CLASSIFICATION_METRICS',
+    'FEATURE_SET_ORDER',
+    'FEATURE_SET_PALETTE',
+    'TCGA_SAMPLES',
+    'PMD_PATH',
+    'cohort_output_dir',
+    'parse_feature_counts',
+    'make_sample_types',
+    'summarize_cohort_samples',
+    'build_per_cancer_cohort_manifest',
+    'save_feature_classification_outputs',
+    'load_saved_feature_classification_task',
+    'collect_saved_feature_classification_outputs',
+    'run_cohort_feature_classification',
+    'load_tcga_samples',
+    'load_methylation_data',
+    'build_measured_cpg_anchor_table',
+    'load_pmds_per_sample',
+    'collect_all_pmds',
+    'load_cgis',
+    'pick_recurrent_pmds',
+    'fit_gamma_length_distribution',
+    'pick_random_methylation_regions',
+    'pick_features',
+    'run_feature_classification',
+    'summarize_classification_results',
+    'plot_classification_results',
+    'plot_classification_box_results',
+    'plot_sampled_feature_length_distributions',
+]

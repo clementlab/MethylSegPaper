@@ -26,6 +26,24 @@ LOWER_IS_BETTER_PATTERNS = (
     "mean_false_pmds_called",
 )
 
+NEAR_ONE_METRIC_ORDER = {
+    "fragmentation_mean": "fragmentation_distance_from_1_mean",
+    "absorption_mean": "absorption_distance_from_1_mean",
+    "absolute_fragmentation_mean": "absolute_fragmentation_distance_from_1_mean",
+    "absolute_absorption_mean": "absolute_absorption_distance_from_1_mean",
+}
+
+METRIC_TITLE_OVERRIDES = {
+    "fragmentation": "Fragmentation Over Recalled True PMDs",
+    "absorption": "Absorption Over Overlapping Called PMDs",
+    "fragmentation_distance_from_1": "Fragmentation Distance From 1",
+    "absorption_distance_from_1": "Absorption Distance From 1",
+    "absolute_fragmentation": "Absolute Fragmentation Across All True PMDs",
+    "absolute_absorption": "Absolute Absorption Across All Called PMDs",
+    "absolute_fragmentation_distance_from_1": "Absolute Fragmentation Distance From 1",
+    "absolute_absorption_distance_from_1": "Absolute Absorption Distance From 1",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -40,6 +58,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def metric_title(metric: str) -> str:
+    if metric in METRIC_TITLE_OVERRIDES:
+        return METRIC_TITLE_OVERRIDES[metric]
     title = metric.replace("_", " ").title()
     return title.replace("Bp", "BP").replace("Pmd", "PMD").replace("Mabe", "MABE")
 
@@ -54,10 +74,11 @@ def lower_is_better(metric: str) -> bool:
 
 
 def ordered_summary_for_metric(per_tool_summary_df: pd.DataFrame, metric_col: str):
+    order_metric = NEAR_ONE_METRIC_ORDER.get(metric_col, metric_col)
     return sah.sort_tools_methylseg_first(
         per_tool_summary_df,
-        metric_col=metric_col,
-        ascending=lower_is_better(metric_col),
+        metric_col=order_metric,
+        ascending=lower_is_better(order_metric),
     )
 
 
@@ -162,24 +183,14 @@ def write_metric_plots(
 
     for metric in sah.metric_column_names():
         metric_col = f"{metric}_mean"
-        add_metric_bar_plot(per_tool_summary_df, metric_col, plot_dir, figures)
-
-    add_metric_bar_plot(
-        per_tool_summary_df,
-        "fragmentation_distance_from_1_mean",
-        plot_dir,
-        figures,
-        title="Mean fragmentation distance from 1 by tool",
-        key="fragmentation_distance_from_1",
-    )
-    add_metric_bar_plot(
-        per_tool_summary_df,
-        "absorption_distance_from_1_mean",
-        plot_dir,
-        figures,
-        title="Mean absorption distance from 1 by tool",
-        key="absorption_distance_from_1",
-    )
+        add_metric_bar_plot(
+            per_tool_summary_df,
+            metric_col,
+            plot_dir,
+            figures,
+            title=f"Mean {metric_title(metric)} by tool",
+            key=metric,
+        )
     add_metric_bar_plot(
         per_tool_summary_df,
         "region_any_recall_mean",

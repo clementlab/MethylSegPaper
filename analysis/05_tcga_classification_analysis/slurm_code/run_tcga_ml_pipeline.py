@@ -4,6 +4,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pandas as pd
+
 matplotlib_cache_dir = Path(tempfile.gettempdir()) / f"matplotlib-{os.getuid()}"
 matplotlib_cache_dir.mkdir(parents=True, exist_ok=True)
 os.environ["MPLCONFIGDIR"] = str(matplotlib_cache_dir)
@@ -15,138 +17,117 @@ for import_path in (PROJECT_ROOT, TCGA_ANALYSIS_DIR):
     if import_str not in sys.path:
         sys.path.insert(0, import_str)
 
-from utils.tcga_ml_pipeline import (  # noqa: E402
-    DEFAULT_CGI_BED,
-    DEFAULT_GENOME_FILE,
-    DEFAULT_OUT_DIR,
-    DEFAULT_SEGMENTATION_ROOT,
-    PipelineConfig,
-    parse_n_values,
-    recalculate_metrics_from_dir,
-    run_pipeline,
+from repo_paths import TCGA_CLASSIFICATION_RESULTS_DIR  # noqa: E402
+from utils.tcga_ml_pipeline import run_cohort_feature_classification  # noqa: E402
+
+DEFAULT_OUT_ROOT = TCGA_CLASSIFICATION_RESULTS_DIR / "ml_outputs" / "per_cancer"
+DEFAULT_COHORT_MANIFEST = (
+    TCGA_CLASSIFICATION_RESULTS_DIR / "manifests" / "tcga_ml_cohorts.tsv"
 )
 
 
-def parse_case_sets(value: str) -> tuple[str, ...]:
-    allowed = {"brca", "per_cancer", "pan_cancer", "multiclass"}
-    case_sets = tuple(piece.strip() for piece in value.split(",") if piece.strip())
-    unknown = sorted(set(case_sets) - allowed)
-    if unknown:
-        raise ValueError(f"Unknown case sets: {unknown}. Allowed: {sorted(allowed)}")
-    if not case_sets:
-        raise ValueError("At least one case set is required.")
-    return case_sets
+def load_cohort_manifest(manifest_path: str | Path) -> Path:
+    manifest_path = Path(manifest_path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Cohort manifest does not exist: {manifest_path}")
+    return manifest_path
+
+
+def resolve_cohort_id(
+    *,
+    cohort_id: str | None,
+    cohort_manifest: str | Path | None,
+    array_index: int | None,
+) -> str:
+    if cohort_id:
+        return str(cohort_id)
+    if cohort_manifest is None or array_index is None:
+        raise ValueError(
+            "Provide either --cohort-id directly or both --cohort-manifest and --array-index."
+        )
+
+    manifest_path = load_cohort_manifest(cohort_manifest)
+    cohort_df = pd.read_csv(manifest_path, sep="\t").copy()
+    if "cohort_id" not in cohort_df.columns:
+        raise ValueError(f"Cohort manifest is missing a cohort_id column: {manifest_path}")
+    if array_index < 1 or array_index > len(cohort_df):
+        raise ValueError(
+            f"--array-index must be between 1 and {len(cohort_df)} inclusive; got {array_index}."
+        )
+    return str(cohort_df.iloc[array_index - 1]["cohort_id"])
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run or recalculate the TCGA PMD ML classification pipeline."
+        description="Run one per-cancer TCGA feature-classification task."
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    run_parser = subparsers.add_parser("run", help="Run CV training and prediction.")
-    run_parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    run_parser.add_argument(
-        "--segmentation-root", type=Path, default=DEFAULT_SEGMENTATION_ROOT
-    )
-    run_parser.add_argument(
-        "--case-sets",
+    parser.add_argument(
+        "--cohort-id",
         type=str,
-        default="brca,per_cancer,pan_cancer,multiclass",
-        help="Comma-separated subset of brca,per_cancer,pan_cancer,multiclass.",
+        default=None,
+        help="TCGA cohort ID such as TCGA-BRCA.",
     )
-    run_parser.add_argument(
-        "--n-values",
-        type=str,
-        default="",
-        help="Comma-separated region counts. Defaults to 1,3,5,10,50,100,500,1000.",
+    parser.add_argument(
+        "--cohort-manifest",
+        type=Path,
+        default=None,
+        help="Optional cohort manifest used with --array-index.",
     )
-    run_parser.add_argument("--cv-splits", type=int, default=5)
-    run_parser.add_argument("--n-estimators", type=int, default=500)
-    run_parser.add_argument("--random-state", type=int, default=42)
-    run_parser.add_argument("--cgi-bed", type=Path, default=DEFAULT_CGI_BED)
-    run_parser.add_argument("--genome-file", type=Path, default=DEFAULT_GENOME_FILE)
-    run_parser.add_argument(
-        "--max-samples-per-class",
+    parser.add_argument(
+        "--array-index",
         type=int,
         default=None,
-        help="Optional debug cap applied within each cohort label.",
+        help="1-based array index into the cohort manifest.",
     )
-    run_parser.add_argument(
-        "--no-save-feature-matrices",
+    parser.add_argument(
+        "--feature-count",
+        type=int,
+        required=True,
+        help="Number of regions to evaluate for this task.",
+    )
+    parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument("--n-repeats", type=int, default=10)
+    parser.add_argument("--n-feature-draws", type=int, default=5)
+    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--max-split-workers", type=int, default=50)
+    parser.add_argument("--min-cpgs-for-random-regions", type=int, default=1)
+    parser.add_argument(
+        "--exclude-top-normal-shared-pmds",
         action="store_true",
-        help="Skip writing per-fold feature matrices.",
-    )
-    run_parser.add_argument(
-        "--allow-missing-feature-sets",
-        action="store_true",
-        help="Diagnostic mode: continue when required feature sets fail.",
-    )
-    run_parser.add_argument(
-        "--no-call-missing-pmds",
-        action="store_true",
-        help="Do not run MethylSeg to create missing PMD files before preflight.",
-    )
-    run_parser.add_argument(
-        "--high-confidence-pmd-min-fraction",
-        type=float,
-        default=0.50,
         help=(
-            "Minimum training-sample PMD support fraction used to define "
-            "high-confidence PMDs that Random regions must avoid."
+            "Remove tumor training PMDs that overlap the top n recurrent normal "
+            "PMDs in each fold before selecting recurrent tumor PMDs."
         ),
     )
-    run_parser.add_argument(
-        "--random-region-min-length-bp",
-        type=int,
-        default=150000,
-        help="Minimum Random-region length in base pairs.",
-    )
-    run_parser.add_argument(
-        "--random-region-max-length-bp",
-        type=int,
-        default=20000000,
-        help="Maximum Random-region length in base pairs.",
-    )
-
-    recalc_parser = subparsers.add_parser(
-        "recalculate-metrics",
-        help="Regenerate metrics and plots from saved prediction artifacts.",
-    )
-    recalc_parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT)
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     try:
-        if args.command == "run":
-            config = PipelineConfig(
-                out_dir=args.out_dir,
-                segmentation_root=args.segmentation_root,
-                case_sets=parse_case_sets(args.case_sets),
-                n_values=parse_n_values(args.n_values),
-                cv_splits=args.cv_splits,
-                n_estimators=args.n_estimators,
-                random_state=args.random_state,
-                cgi_bed=args.cgi_bed,
-                genome_file=args.genome_file,
-                max_samples_per_class=args.max_samples_per_class,
-                save_feature_matrices=not args.no_save_feature_matrices,
-                allow_missing_feature_sets=args.allow_missing_feature_sets,
-                call_missing_pmds=not args.no_call_missing_pmds,
-                high_confidence_pmd_min_fraction=args.high_confidence_pmd_min_fraction,
-                random_region_min_length_bp=args.random_region_min_length_bp,
-                random_region_max_length_bp=args.random_region_max_length_bp,
-            )
-            outputs = run_pipeline(config)
-        else:
-            outputs = recalculate_metrics_from_dir(args.out_dir)
-    except ValueError as exc:
+        cohort_id = resolve_cohort_id(
+            cohort_id=args.cohort_id,
+            cohort_manifest=args.cohort_manifest,
+            array_index=args.array_index,
+        )
+        outputs = run_cohort_feature_classification(
+            cohort_id=cohort_id,
+            feature_count=args.feature_count,
+            n_splits=args.n_splits,
+            n_repeats=args.n_repeats,
+            n_feature_draws=args.n_feature_draws,
+            random_seed=args.random_seed,
+            max_split_workers=args.max_split_workers,
+            out_root=args.out_root,
+            exclude_top_normal_shared_pmds=args.exclude_top_normal_shared_pmds,
+            min_cpgs_for_random_regions=args.min_cpgs_for_random_regions,
+        )
+    except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
+        raise
 
-    print("Wrote TCGA ML outputs:")
+    print("Wrote TCGA ML task outputs:")
     for name, path in sorted(outputs.items()):
         print(f"  {name}: {path}")
 

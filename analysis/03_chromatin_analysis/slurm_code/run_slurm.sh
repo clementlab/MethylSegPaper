@@ -128,8 +128,10 @@ chromatin_dir = Path(sys.argv[2])
 dependent_job_id = sys.argv[3].strip()
 samples = ["ESO26.wgbs", "TE5.wgbs"]
 tool_paths = {
-    "methylseg": ["methylseg", "{sample}", "out", "wgbs", "summary_files", "segments_cleaned_PMD.bed"],
-    "methylseg_hm450k": ["methylseg", "{sample}", "out", "hm450k", "summary_files", "segments_cleaned_PMD.bed"],
+    "methylseg_raw": ["methylseg", "{sample}", "out", "wgbs", "summary_files", "segments_raw_PMD.bed"],
+    "methylseg_cleaned": ["methylseg", "{sample}", "out", "wgbs", "summary_files", "segments_cleaned_PMD.bed"],
+    "methylseg_hm450k_raw": ["methylseg", "{sample}", "out", "hm450k", "summary_files", "segments_raw_PMD.bed"],
+    "methylseg_hm450k_cleaned": ["methylseg", "{sample}", "out", "hm450k", "summary_files", "segments_cleaned_PMD.bed"],
     "methylseekr": ["methylseekr", "{sample}", "out", "methylseekr_PMDs.bed"],
     "dnmtools": ["dnmtools", "{sample}", "out", "dnmtools_PMDs.bed"],
     "dnmtools_array": ["dnmtools", "{sample}", "out", "arraymode.dnmtools_PMDs.bed"],

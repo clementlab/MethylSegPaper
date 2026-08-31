@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from io import StringIO
 from pathlib import Path
 import subprocess
+import sys
+from typing import Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,6 +16,21 @@ import pyBigWig
 import seaborn as sns
 import yaml
 from plotly.subplots import make_subplots
+
+FIGURES_DIR = Path(__file__).resolve().parents[1]
+if str(FIGURES_DIR) not in sys.path:
+    sys.path.insert(0, str(FIGURES_DIR))
+
+from colors import (
+    ANNOTATION_COLORS,
+    LAD_TOOL_COLORS,
+    NEUTRAL_COLORS,
+    SYNTHETIC_INTERVAL_STYLES,
+    SYNTHETIC_TRACK_COLORS,
+    TOOL_DISTINCT_COLORS_BY_SLUG,
+    TOOL_HIGHLIGHT_COLORS,
+    TOOL_HIGHLIGHT_COLORS_BY_SLUG,
+)
 
 
 DATA_DIR = Path(
@@ -31,6 +50,49 @@ SYNTHETIC_FIGURE_OUTPUT_DIR = OUT_DIR / "03_synthetic_figures"
 CHROMATIN_FIGURE_OUTPUT_DIR = OUT_DIR / "chromatin_figures"
 REFERENCE_DATA_DIR = DATA_DIR / "reference_data"
 METHYLSEG_RESULTS_DIR = RESULTS_DIR / "01_region_calling_analysis" / "methylseg"
+OVERLAP_RESULTS_DIR = (
+    RESULTS_DIR / "01_region_calling_analysis" / "methylseg_hm450k_overlap"
+)
+OVERLAP_CACHE_VERSION = "v2_union_coverage"
+METHYLSEG_TUMOR_SAMPLE_IDS = [
+    "ESO26.wgbs",
+    "TE5.wgbs",
+    "WGBS_colon-primary-tumor_1_meth",
+    "WGBS_colon-primary-tumor_2_meth",
+    "WGBS_colon-primary-tumor_3_meth",
+]
+HM450K_REGION_COLUMNS = [
+    "sample_id",
+    "category",
+    "platform",
+    "chrom",
+    "start",
+    "end",
+    "region_length_bp",
+    "max_overlap_bp",
+    "max_overlap_fraction_hm450k",
+    "n_qualifying_overlaps",
+    "hm450k_probe_count",
+    "wgbs_cpg_count",
+    "probe_reduction_fraction",
+    "avg_methylation",
+]
+WGBS_REGION_COLUMNS = [
+    "sample_id",
+    "category",
+    "platform",
+    "chrom",
+    "start",
+    "end",
+    "region_length_bp",
+    "max_overlap_bp",
+    "max_overlap_fraction_hm450k",
+    "n_qualifying_overlaps",
+    "hm450k_probe_count",
+    "wgbs_cpg_count",
+    "probe_reduction_fraction",
+    "avg_methylation",
+]
 TOOL_REGISTRY = [
     {
         "tool": "methylseg",
@@ -201,7 +263,6 @@ REGION_TYPE_BY_EXPORT_SLUG = {
 def wgbs_cancer_samples() -> list[str]:
     return [
         "ESO26.wgbs",
-        "SRR26107673",
         "TE5.wgbs",
         "WGBS_colon-primary-tumor_1_meth",
         # "WGBS_colon-primary-tumor_2_meth",
@@ -597,9 +658,587 @@ def export_methylation_bigwig(
     chrom_sizes = _load_chrom_sizes(genome)
     return _write_bigwig(beta_df, out_path, chrom_sizes)
 
+
+def get_methylseg_tumor_samples() -> list[str]:
+    return list(METHYLSEG_TUMOR_SAMPLE_IDS)
+
+
+def build_methylseg_hm450k_overlap_cache(
+    *,
+    sample_ids: Iterable[str] | None = None,
+    threshold_req: int | float = 1,
+    force: bool = False,
+) -> dict[str, Path]:
+    sample_ids = _normalize_overlap_sample_ids(sample_ids)
+    threshold_kind, threshold_value = _normalize_overlap_threshold_req(threshold_req)
+    cache_dir = _overlap_cache_dir_for(sample_ids, threshold_kind, threshold_value)
+    sample_summary_path = cache_dir / "sample_summary.tsv"
+    hm450k_metrics_path = cache_dir / "hm450k_region_metrics.tsv"
+    wgbs_metrics_path = cache_dir / "wgbs_region_metrics.tsv"
+    metadata_path = cache_dir / "metadata.json"
+
+    if (
+        not force
+        and sample_summary_path.exists()
+        and hm450k_metrics_path.exists()
+        and wgbs_metrics_path.exists()
+        and metadata_path.exists()
+    ):
+        return {
+            "cache_dir": cache_dir,
+            "sample_summary": sample_summary_path,
+            "hm450k_region_metrics": hm450k_metrics_path,
+            "wgbs_region_metrics": wgbs_metrics_path,
+            "metadata": metadata_path,
+        }
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    hm450k_frames = []
+    wgbs_frames = []
+    sample_summary_rows: list[dict[str, object]] = []
+
+    for sample_id in sample_ids:
+        sample_result = _build_methylseg_overlap_sample_tables(
+            sample_id=sample_id,
+            threshold_kind=threshold_kind,
+            threshold_value=threshold_value,
+        )
+        hm450k_frames.append(sample_result["hm450k_df"])
+        wgbs_frames.append(sample_result["wgbs_df"])
+        sample_summary_rows.append(sample_result["sample_summary"])
+
+    hm450k_df = (
+        pd.concat(hm450k_frames, ignore_index=True)
+        if hm450k_frames
+        else pd.DataFrame(columns=HM450K_REGION_COLUMNS)
+    )
+    wgbs_df = (
+        pd.concat(wgbs_frames, ignore_index=True)
+        if wgbs_frames
+        else pd.DataFrame(columns=WGBS_REGION_COLUMNS)
+    )
+    sample_summary_df = pd.DataFrame(sample_summary_rows)
+
+    hm450k_df.to_csv(hm450k_metrics_path, sep="\t", index=False)
+    wgbs_df.to_csv(wgbs_metrics_path, sep="\t", index=False)
+    sample_summary_df.to_csv(sample_summary_path, sep="\t", index=False)
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "cache_version": OVERLAP_CACHE_VERSION,
+                "sample_ids": sample_ids,
+                "threshold_kind": threshold_kind,
+                "threshold_value": threshold_value,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    return {
+        "cache_dir": cache_dir,
+        "sample_summary": sample_summary_path,
+        "hm450k_region_metrics": hm450k_metrics_path,
+        "wgbs_region_metrics": wgbs_metrics_path,
+        "metadata": metadata_path,
+    }
+
+
+def load_methylseg_hm450k_overlap_sample_summary(
+    *,
+    sample_ids: list[str] | None = None,
+    threshold_req: int | float = 1,
+    force: bool = False,
+) -> pd.DataFrame:
+    paths = build_methylseg_hm450k_overlap_cache(
+        sample_ids=sample_ids,
+        threshold_req=threshold_req,
+        force=force,
+    )
+    return pd.read_csv(paths["sample_summary"], sep="\t")
+
+
+def load_methylseg_hm450k_overlap_hm450k_region_metrics(
+    *,
+    sample_ids: list[str] | None = None,
+    threshold_req: int | float = 1,
+    force: bool = False,
+) -> pd.DataFrame:
+    paths = build_methylseg_hm450k_overlap_cache(
+        sample_ids=sample_ids,
+        threshold_req=threshold_req,
+        force=force,
+    )
+    return pd.read_csv(paths["hm450k_region_metrics"], sep="\t")
+
+
+def load_methylseg_hm450k_overlap_wgbs_region_metrics(
+    *,
+    sample_ids: list[str] | None = None,
+    threshold_req: int | float = 1,
+    force: bool = False,
+) -> pd.DataFrame:
+    paths = build_methylseg_hm450k_overlap_cache(
+        sample_ids=sample_ids,
+        threshold_req=threshold_req,
+        force=force,
+    )
+    return pd.read_csv(paths["wgbs_region_metrics"], sep="\t")
+
+
+def _normalize_overlap_sample_ids(sample_ids: Iterable[str] | None) -> list[str]:
+    if sample_ids is None:
+        return list(METHYLSEG_TUMOR_SAMPLE_IDS)
+
+    normalized = [str(sample_id) for sample_id in sample_ids]
+    if not normalized:
+        raise ValueError("sample_ids must contain at least one sample.")
+    return normalized
+
+
+def _normalize_overlap_threshold_req(
+    threshold_req: int | float,
+) -> tuple[str, int | float]:
+    if isinstance(threshold_req, bool):
+        raise TypeError("threshold_req must be an int or float, not bool.")
+
+    if isinstance(threshold_req, int):
+        if threshold_req < 1:
+            raise ValueError("Integer threshold_req values must be >= 1.")
+        return "bp", int(threshold_req)
+
+    threshold_float = float(threshold_req)
+    if threshold_float <= 0 or threshold_float > 1:
+        raise ValueError("Float threshold_req values must be in the interval (0, 1].")
+    return "fraction", threshold_float
+
+
+def _overlap_cache_dir_for(
+    sample_ids: list[str],
+    threshold_kind: str,
+    threshold_value: int | float,
+) -> Path:
+    sample_key = hashlib.md5(
+        "\n".join(sorted(sample_ids)).encode("utf-8")
+    ).hexdigest()[:12]
+    if threshold_kind == "bp":
+        threshold_key = f"bp_{int(threshold_value)}"
+    else:
+        threshold_key = f"fraction_{float(threshold_value):0.4f}".replace(".", "p")
+    return OVERLAP_RESULTS_DIR / (
+        f"{sample_key}__{threshold_key}__{OVERLAP_CACHE_VERSION}"
+    )
+
+
+def _build_methylseg_overlap_sample_tables(
+    *,
+    sample_id: str,
+    threshold_kind: str,
+    threshold_value: int | float,
+) -> dict[str, object]:
+    prep_dir = METHYLSEG_RESULTS_DIR / sample_id / "prep"
+    hm450k_regions = _load_overlap_region_df(
+        METHYLSEG_RESULTS_DIR
+        / sample_id
+        / "out"
+        / "hm450k"
+        / "summary_files"
+        / "segments_cleaned_PMD.bed"
+    )
+    wgbs_regions = _load_overlap_region_df(
+        METHYLSEG_RESULTS_DIR
+        / sample_id
+        / "out"
+        / "wgbs"
+        / "summary_files"
+        / "segments_cleaned_PMD.bed"
+    )
+    hm450k_points = _load_overlap_point_track(prep_dir / "450k_meth_ref.tsv")
+    wgbs_points = _load_overlap_point_track(prep_dir / "wgbs_meth_ref.tsv")
+
+    wgbs_by_chrom = _group_overlap_intervals_by_chrom(wgbs_regions)
+    hm450k_overlap_rows = []
+    for row in hm450k_regions.itertuples(index=False):
+        chrom = str(row.chrom)
+        q_start = int(row.start)
+        q_end = int(row.end)
+        q_len = max(q_end - q_start, 1)
+        starts, ends, _ = wgbs_by_chrom.get(
+            chrom,
+            (
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+            ),
+        )
+        overlap_stats = _compute_interval_overlap_stats(q_start, q_end, starts, ends)
+        max_overlap_bp = overlap_stats["max_overlap_bp"]
+        max_overlap_fraction = overlap_stats["covered_bp"] / q_len
+        if threshold_kind == "bp":
+            is_shared = overlap_stats["covered_bp"] >= int(threshold_value)
+        else:
+            is_shared = (overlap_stats["covered_bp"] / q_len) >= float(
+                threshold_value
+            )
+        hm450k_overlap_rows.append(
+            {
+                "max_overlap_bp": max_overlap_bp,
+                "max_overlap_fraction_hm450k": float(max_overlap_fraction),
+                "n_qualifying_overlaps": (
+                    overlap_stats["overlap_count"] if is_shared else 0
+                ),
+                "is_shared": bool(is_shared),
+            }
+        )
+    hm450k_overlap_df = pd.DataFrame(hm450k_overlap_rows)
+
+    hm450k_signal_df = _summarize_overlap_points_by_region(hm450k_regions, hm450k_points)
+    hm450k_wgbs_cpg_df = _summarize_overlap_points_by_region(hm450k_regions, wgbs_points)
+    hm450k_metrics_df = hm450k_regions.copy()
+    hm450k_metrics_df["sample_id"] = sample_id
+    hm450k_metrics_df["category"] = np.where(
+        hm450k_overlap_df["is_shared"].to_numpy(dtype=bool),
+        "shared",
+        "microarray_unique",
+    )
+    hm450k_metrics_df["platform"] = "hm450k"
+    hm450k_metrics_df["region_length_bp"] = (
+        hm450k_metrics_df["end"] - hm450k_metrics_df["start"]
+    ).astype(np.int64)
+    hm450k_metrics_df["max_overlap_bp"] = hm450k_overlap_df["max_overlap_bp"].astype(
+        np.int64
+    )
+    hm450k_metrics_df["max_overlap_fraction_hm450k"] = hm450k_overlap_df[
+        "max_overlap_fraction_hm450k"
+    ].astype(float)
+    hm450k_metrics_df["n_qualifying_overlaps"] = hm450k_overlap_df[
+        "n_qualifying_overlaps"
+    ].astype(np.int64)
+    hm450k_metrics_df["hm450k_probe_count"] = hm450k_signal_df["point_count"].astype(
+        np.int64
+    )
+    hm450k_metrics_df["wgbs_cpg_count"] = hm450k_wgbs_cpg_df["point_count"].astype(
+        np.int64
+    )
+    hm450k_metrics_df["probe_reduction_fraction"] = _compute_probe_reduction_fraction(
+        hm450k_metrics_df["hm450k_probe_count"].to_numpy(dtype=float),
+        hm450k_metrics_df["wgbs_cpg_count"].to_numpy(dtype=float),
+    )
+    hm450k_metrics_df["avg_methylation"] = hm450k_signal_df["mean_beta"].astype(float)
+    hm450k_metrics_df = hm450k_metrics_df.loc[:, HM450K_REGION_COLUMNS]
+
+    hm450k_by_chrom = _group_overlap_intervals_by_chrom(hm450k_regions)
+    wgbs_overlap_rows = []
+    for row in wgbs_regions.itertuples(index=False):
+        chrom = str(row.chrom)
+        q_start = int(row.start)
+        q_end = int(row.end)
+        q_len = max(q_end - q_start, 1)
+        starts, ends, _ = hm450k_by_chrom.get(
+            chrom,
+            (
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+            ),
+        )
+        overlap_stats = _compute_interval_overlap_stats(q_start, q_end, starts, ends)
+        max_overlap_bp = overlap_stats["max_overlap_bp"]
+        if threshold_kind == "bp":
+            is_microarray_missed = overlap_stats["covered_bp"] < int(threshold_value)
+        else:
+            is_microarray_missed = (
+                overlap_stats["covered_bp"] / q_len
+            ) < float(threshold_value)
+        wgbs_overlap_rows.append(
+            {
+                "max_overlap_bp": max_overlap_bp,
+                "n_qualifying_overlaps": (
+                    0 if is_microarray_missed else overlap_stats["overlap_count"]
+                ),
+                "is_microarray_missed": bool(is_microarray_missed),
+            }
+        )
+    wgbs_overlap_df = pd.DataFrame(wgbs_overlap_rows)
+
+    wgbs_probe_df = _summarize_overlap_points_by_region(wgbs_regions, hm450k_points)
+    wgbs_signal_df = _summarize_overlap_points_by_region(wgbs_regions, wgbs_points)
+    wgbs_metrics_df = wgbs_regions.copy()
+    wgbs_metrics_df["sample_id"] = sample_id
+    wgbs_metrics_df["category"] = np.where(
+        wgbs_overlap_df["is_microarray_missed"].to_numpy(dtype=bool),
+        "microarray_missed",
+        "captured_by_microarray",
+    )
+    wgbs_metrics_df["platform"] = "wgbs"
+    wgbs_metrics_df["region_length_bp"] = (
+        wgbs_metrics_df["end"] - wgbs_metrics_df["start"]
+    ).astype(np.int64)
+    wgbs_metrics_df["max_overlap_bp"] = wgbs_overlap_df["max_overlap_bp"].astype(
+        np.int64
+    )
+    wgbs_metrics_df["max_overlap_fraction_hm450k"] = np.nan
+    wgbs_metrics_df["n_qualifying_overlaps"] = wgbs_overlap_df[
+        "n_qualifying_overlaps"
+    ].astype(np.int64)
+    wgbs_metrics_df["hm450k_probe_count"] = wgbs_probe_df["point_count"].astype(
+        np.int64
+    )
+    wgbs_metrics_df["wgbs_cpg_count"] = wgbs_signal_df["point_count"].astype(
+        np.int64
+    )
+    wgbs_metrics_df["probe_reduction_fraction"] = _compute_probe_reduction_fraction(
+        wgbs_metrics_df["hm450k_probe_count"].to_numpy(dtype=float),
+        wgbs_metrics_df["wgbs_cpg_count"].to_numpy(dtype=float),
+    )
+    wgbs_metrics_df["avg_methylation"] = wgbs_signal_df["mean_beta"].astype(float)
+    wgbs_metrics_df = wgbs_metrics_df.loc[
+        wgbs_metrics_df["category"] == "microarray_missed",
+        WGBS_REGION_COLUMNS,
+    ].reset_index(drop=True)
+
+    sample_summary = {
+        "sample_id": sample_id,
+        "threshold_kind": threshold_kind,
+        "threshold_value": threshold_value,
+        "hm450k_total_regions": int(len(hm450k_regions)),
+        "hm450k_shared_regions": int(
+            (hm450k_metrics_df["category"] == "shared").sum()
+        ),
+        "hm450k_microarray_unique_regions": int(
+            (hm450k_metrics_df["category"] == "microarray_unique").sum()
+        ),
+        "wgbs_total_regions": int(len(wgbs_regions)),
+        "wgbs_microarray_missed_regions": int(
+            (wgbs_metrics_df["category"] == "microarray_missed").sum()
+        ),
+        "hm450k_total_bp": int(hm450k_metrics_df["region_length_bp"].sum()),
+        "hm450k_shared_bp": int(
+            hm450k_metrics_df.loc[
+                hm450k_metrics_df["category"] == "shared",
+                "region_length_bp",
+            ].sum()
+        ),
+        "hm450k_microarray_unique_bp": int(
+            hm450k_metrics_df.loc[
+                hm450k_metrics_df["category"] == "microarray_unique",
+                "region_length_bp",
+            ].sum()
+        ),
+        "wgbs_total_bp": int((wgbs_regions["end"] - wgbs_regions["start"]).sum()),
+        "wgbs_microarray_missed_bp": int(wgbs_metrics_df["region_length_bp"].sum()),
+    }
+
+    return {
+        "hm450k_df": hm450k_metrics_df,
+        "wgbs_df": wgbs_metrics_df,
+        "sample_summary": sample_summary,
+    }
+
+
+def _load_overlap_region_df(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Region BED not found: {path}")
+
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        header=None,
+        names=["chrom", "start", "end", "label"],
+        usecols=[0, 1, 2],
+    )
+    df["chrom"] = df["chrom"].astype(str)
+    df["start"] = pd.to_numeric(df["start"], errors="raise").astype(np.int64)
+    df["end"] = pd.to_numeric(df["end"], errors="raise").astype(np.int64)
+    return df.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+
+
+def _load_overlap_point_track(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Point track not found: {path}")
+
+    df = pd.read_csv(path, sep="\t")
+    df = df.rename(
+        columns={
+            "CpG_chrm": "chrom",
+            "CpG_beg": "start",
+            "CpG_end": "end",
+        }
+    )
+    missing_cols = [
+        col for col in ["chrom", "start", "end", "beta"] if col not in df.columns
+    ]
+    if missing_cols:
+        raise ValueError(f"Point track {path} is missing required columns {missing_cols}.")
+
+    df["chrom"] = df["chrom"].astype(str)
+    df["start"] = pd.to_numeric(df["start"], errors="raise").astype(np.int64)
+    df["end"] = pd.to_numeric(df["end"], errors="raise").astype(np.int64)
+    df["beta"] = pd.to_numeric(df["beta"], errors="coerce")
+    return df.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+
+
+def _group_overlap_intervals_by_chrom(
+    df: pd.DataFrame,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    grouped: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for chrom, chrom_df in df.groupby("chrom", sort=False):
+        starts = chrom_df["start"].to_numpy(dtype=np.int64)
+        ends = chrom_df["end"].to_numpy(dtype=np.int64)
+        lengths = ends - starts
+        grouped[str(chrom)] = (starts, ends, lengths)
+    return grouped
+
+
+def _group_overlap_points_by_chrom(
+    df: pd.DataFrame,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    grouped: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for chrom, chrom_df in df.groupby("chrom", sort=False):
+        grouped[str(chrom)] = (
+            chrom_df["start"].to_numpy(dtype=np.int64),
+            chrom_df["beta"].to_numpy(dtype=float),
+        )
+    return grouped
+
+
+def _candidate_overlap_slice(
+    query_start: int,
+    query_end: int,
+    target_starts: np.ndarray,
+    target_ends: np.ndarray,
+) -> slice:
+    if target_starts.size == 0:
+        return slice(0, 0)
+    left = int(np.searchsorted(target_ends, query_start, side="right"))
+    right = int(np.searchsorted(target_starts, query_end, side="left"))
+    return slice(left, right)
+
+
+def _candidate_overlaps(
+    query_start: int,
+    query_end: int,
+    target_starts: np.ndarray,
+    target_ends: np.ndarray,
+) -> np.ndarray:
+    candidates = _candidate_overlap_slice(
+        query_start,
+        query_end,
+        target_starts,
+        target_ends,
+    )
+    if candidates.start >= candidates.stop:
+        return np.array([], dtype=np.int64)
+    overlaps = np.minimum(target_ends[candidates], query_end) - np.maximum(
+        target_starts[candidates], query_start
+    )
+    overlaps = overlaps[overlaps > 0]
+    return overlaps.astype(np.int64, copy=False)
+
+
+def _compute_interval_overlap_stats(
+    query_start: int,
+    query_end: int,
+    target_starts: np.ndarray,
+    target_ends: np.ndarray,
+) -> dict[str, int]:
+    overlaps = _candidate_overlaps(query_start, query_end, target_starts, target_ends)
+    if overlaps.size == 0:
+        return {
+            "overlap_count": 0,
+            "max_overlap_bp": 0,
+            "covered_bp": 0,
+        }
+
+    overlap_slice = _candidate_overlap_slice(
+        query_start,
+        query_end,
+        target_starts,
+        target_ends,
+    )
+    clipped_starts = np.maximum(target_starts[overlap_slice], query_start)
+    clipped_ends = np.minimum(target_ends[overlap_slice], query_end)
+    valid_mask = clipped_ends > clipped_starts
+    clipped_starts = clipped_starts[valid_mask]
+    clipped_ends = clipped_ends[valid_mask]
+
+    covered_bp = 0
+    current_start = int(clipped_starts[0])
+    current_end = int(clipped_ends[0])
+    for start, end in zip(clipped_starts[1:], clipped_ends[1:]):
+        start = int(start)
+        end = int(end)
+        if start > current_end:
+            covered_bp += current_end - current_start
+            current_start = start
+            current_end = end
+        else:
+            current_end = max(current_end, end)
+    covered_bp += current_end - current_start
+
+    return {
+        "overlap_count": int(overlaps.size),
+        "max_overlap_bp": int(overlaps.max()),
+        "covered_bp": int(covered_bp),
+    }
+
+
+def _summarize_overlap_points_by_region(
+    region_df: pd.DataFrame,
+    point_df: pd.DataFrame,
+) -> pd.DataFrame:
+    point_by_chrom = _group_overlap_points_by_chrom(point_df)
+    rows = []
+
+    for row in region_df.itertuples(index=False):
+        point_starts, betas = point_by_chrom.get(
+            str(row.chrom),
+            (np.array([], dtype=np.int64), np.array([], dtype=float)),
+        )
+        if point_starts.size == 0:
+            rows.append({"point_count": 0, "mean_beta": np.nan})
+            continue
+
+        left = int(np.searchsorted(point_starts, int(row.start), side="left"))
+        right = int(np.searchsorted(point_starts, int(row.end), side="left"))
+        if left >= right:
+            rows.append({"point_count": 0, "mean_beta": np.nan})
+            continue
+
+        interval_betas = betas[left:right]
+        finite_mask = np.isfinite(interval_betas)
+        mean_beta = (
+            float(interval_betas[finite_mask].mean()) if finite_mask.any() else np.nan
+        )
+        rows.append(
+            {
+                "point_count": int(right - left),
+                "mean_beta": mean_beta,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _compute_probe_reduction_fraction(
+    hm450k_probe_count: np.ndarray,
+    wgbs_cpg_count: np.ndarray,
+) -> np.ndarray:
+    hm450k_probe_count = np.asarray(hm450k_probe_count, dtype=float)
+    wgbs_cpg_count = np.asarray(wgbs_cpg_count, dtype=float)
+    result = np.full(wgbs_cpg_count.shape, np.nan, dtype=float)
+    valid_mask = wgbs_cpg_count > 0
+    result[valid_mask] = 1.0 - (
+        hm450k_probe_count[valid_mask] / wgbs_cpg_count[valid_mask]
+    )
+    result[valid_mask] = np.clip(result[valid_mask], 0.0, 1.0)
+    return result
+
 ## Region Comparison Results Helpers
 
 COMPARISON_RESULTS_DIR = RESULTS_DIR / "01_region_calling_analysis" / "comparison"
+HMM_TEST_RESULTS_DIR = RESULTS_DIR / "01_region_calling_analysis" / "hmm_tests"
 
 
 def _iter_comparison_sample_dirs() -> list[Path]:
@@ -625,6 +1264,15 @@ def _load_aggregate_comparison_csv(filename: str) -> pd.DataFrame:
         )
 
     return pd.concat(frames, ignore_index=True)
+
+
+def _load_sample_comparison_csv(sample_id: str, filename: str) -> pd.DataFrame:
+    csv_path = COMPARISON_RESULTS_DIR / sample_id / "aggregate_summaries" / filename
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Comparison aggregate summary not found for sample_id={sample_id!r}: {csv_path}"
+        )
+    return pd.read_csv(csv_path)
 
 def load_tool_regions(sample_id: str, tool: str) -> pd.DataFrame:
     tool_config = _get_tool_config(_canonical_tool_name(tool))
@@ -660,11 +1308,40 @@ def load_pmds(sample_id: str, tool: str) -> pd.DataFrame:
 def get_run_stats_df():
     return _load_aggregate_comparison_csv("all_run_stats.csv")
 
+
+def get_hmm_run_times_df() -> pd.DataFrame:
+    csv_path = HMM_TEST_RESULTS_DIR / "aggregate_summaries" / "all_hmm_run_times.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"HMM timing summary not found: {csv_path}"
+        )
+    return pd.read_csv(csv_path)
+
+
 def get_region_stats_df():
     return _load_aggregate_comparison_csv("all_region_stats.csv")
 
 def get_region_context_df():
     return _load_aggregate_comparison_csv("all_region_context_stats.csv")
+
+
+def get_pairwise_missing_region_context_df() -> pd.DataFrame:
+    return _load_aggregate_comparison_csv("all_pairwise_missing_region_context_stats.csv")
+
+
+def load_sample_region_context_df(sample_id: str | None = None) -> pd.DataFrame:
+    if sample_id is None:
+        return get_region_context_df()
+    return _load_sample_comparison_csv(sample_id, "all_region_context_stats.csv")
+
+
+def load_sample_pairwise_missing_region_context_df(sample_id: str | None = None) -> pd.DataFrame:
+    if sample_id is None:
+        return get_pairwise_missing_region_context_df()
+    return _load_sample_comparison_csv(
+        sample_id,
+        "all_pairwise_missing_region_context_stats.csv",
+    )
 
 
 REGION_CALLING_TOOL_ORDER = [
@@ -688,19 +1365,110 @@ REGION_CALLING_TOOL_LABELS = {
     "methylasso": "MethylLasso",
 }
 REGION_CALLING_POINT_COLORS = {
-    "MethylSeg WGBS": "#0b5394",
-    "MethylSeg HM450K": "#3d85c6",
-    "MethylSeekR": "#9aa0a6",
-    "DNMTools": "#9aa0a6",
-    "DNMTools Array": "#9aa0a6",
-    "DNMTools PMR": "#9aa0a6",
-    "MMSeekR": "#9aa0a6",
-    "MethylLasso": "#9aa0a6",
+    label: TOOL_HIGHLIGHT_COLORS[label]
+    for label in [
+        "MethylSeg WGBS",
+        "MethylSeg HM450K",
+        "MethylSeekR",
+        "DNMTools",
+        "DNMTools Array",
+        "DNMTools PMR",
+        "MMSeekR",
+        "MethylLasso",
+    ]
+}
+PAIRWISE_MISSING_COMPARATOR_LABEL = "Comparator"
+PAIRWISE_MISSING_PLOT_COLORS = {
+    PAIRWISE_MISSING_COMPARATOR_LABEL: TOOL_HIGHLIGHT_COLORS[
+        PAIRWISE_MISSING_COMPARATOR_LABEL
+    ],
+    "MethylSeg WGBS": TOOL_HIGHLIGHT_COLORS["MethylSeg WGBS"],
+    "MethylSeg HM450K": TOOL_HIGHLIGHT_COLORS["MethylSeg HM450K"],
 }
 
 
 def _ordered_region_calling_tool_labels() -> list[str]:
     return [REGION_CALLING_TOOL_LABELS[tool] for tool in REGION_CALLING_TOOL_ORDER]
+
+
+def normalize_region_calling_tool_name(tool_name: str) -> str:
+    return TOOL_ALIASES.get(str(tool_name), str(tool_name))
+
+
+def add_region_calling_tool_labels(
+    df: pd.DataFrame,
+    *,
+    tool_col: str = "tool",
+    normalized_col: str = "tool_normalized",
+    label_col: str = "tool_label",
+) -> pd.DataFrame:
+    out_df = df.copy()
+    out_df[normalized_col] = out_df[tool_col].astype(str).map(
+        normalize_region_calling_tool_name
+    )
+    out_df[label_col] = out_df[normalized_col].map(REGION_CALLING_TOOL_LABELS)
+    out_df[label_col] = pd.Categorical(
+        out_df[label_col],
+        categories=_ordered_region_calling_tool_labels(),
+        ordered=True,
+    )
+    return out_df
+
+
+def _comparison_label_from_id(comparison_id: str) -> str:
+    parts = str(comparison_id).split(" vs ", 1)
+    if len(parts) != 2:
+        return str(comparison_id)
+
+    left, right = parts
+    left_norm = normalize_region_calling_tool_name(left)
+    right_norm = normalize_region_calling_tool_name(right)
+    left_label = REGION_CALLING_TOOL_LABELS.get(left_norm, left)
+    right_label = REGION_CALLING_TOOL_LABELS.get(right_norm, right)
+    return f"{left_label} vs {right_label}"
+
+
+def _comparison_sort_key(comparison_id: str) -> tuple[int, int, str]:
+    parts = str(comparison_id).split(" vs ", 1)
+    if len(parts) != 2:
+        return (len(REGION_CALLING_TOOL_ORDER), len(REGION_CALLING_TOOL_ORDER), str(comparison_id))
+
+    left, right = parts
+    left_norm = normalize_region_calling_tool_name(left)
+    right_norm = normalize_region_calling_tool_name(right)
+    order_lookup = {tool: idx for idx, tool in enumerate(REGION_CALLING_TOOL_ORDER)}
+    return (
+        order_lookup.get(left_norm, len(order_lookup)),
+        order_lookup.get(right_norm, len(order_lookup)),
+        str(comparison_id),
+    )
+
+
+def _pairwise_missing_methylseg_mask(
+    df: pd.DataFrame,
+    *,
+    tool_col: str = "tool_normalized",
+    other_tool_col: str = "other_tool_normalized",
+) -> pd.Series:
+    methylseg_tools = {"methylseg_wgbs", "methylseg_hm450k"}
+    return df.apply(
+        lambda row: len(
+            {str(row[tool_col]), str(row[other_tool_col])} & methylseg_tools
+        )
+        == 1,
+        axis=1,
+    )
+
+
+def _pairwise_missing_plot_label(
+    row: pd.Series,
+    *,
+    tool_col: str = "tool_normalized",
+) -> str:
+    tool_name = str(row[tool_col])
+    if tool_name in {"methylseg_wgbs", "methylseg_hm450k"}:
+        return REGION_CALLING_TOOL_LABELS.get(tool_name, tool_name)
+    return PAIRWISE_MISSING_COMPARATOR_LABEL
 
 
 def _style_region_calling_axis(
@@ -752,14 +1520,14 @@ def plot_summary_table(
             go.Table(
                 header=dict(
                     values=[f"<b>{col}</b>" for col in display_df.columns],
-                    fill_color="#d9d9d9",
+                    fill_color=ANNOTATION_COLORS["table_header_fill"],
                     align="left",
                     font=dict(size=table_font_size),
                     height=header_height,
                 ),
                 cells=dict(
                     values=[display_df[col].tolist() for col in display_df.columns],
-                    fill_color="white",
+                    fill_color=ANNOTATION_COLORS["table_row_fill"],
                     align="left",
                     font=dict(size=table_font_size),
                     height=row_height,
@@ -782,7 +1550,7 @@ def draw_boxplot(
     title: str,
     ylabel: str,
     *,
-    box_fill_color: str = "#d9d9d9",
+    box_fill_color: str = ANNOTATION_COLORS["table_header_fill"],
     box_width: float = 0.6,
 ) -> None:
     sns.boxplot(
@@ -806,7 +1574,7 @@ def draw_violin_with_points(
     title: str,
     ylabel: str,
     *,
-    violin_fill_color: str = "#d9d9d9",
+    violin_fill_color: str = ANNOTATION_COLORS["table_header_fill"],
     violin_width: float = 0.95,
     point_size: int = 18,
     point_alpha: float = 0.65,
@@ -834,7 +1602,7 @@ def draw_violin_with_points(
         )
         body = violin["bodies"][0]
         body.set_facecolor(violin_fill_color)
-        body.set_edgecolor("#5f5f5f")
+        body.set_edgecolor(NEUTRAL_COLORS["dark_gray"])
         body.set_alpha(0.8)
         body.set_linewidth(1.0)
         verts = body.get_paths()[0].vertices
@@ -855,6 +1623,110 @@ def draw_violin_with_points(
     ax.set_xticks(range(len(ordered_labels)))
     ax.set_xticklabels(ordered_labels)
     _style_region_calling_axis(ax, title, ylabel)
+
+
+def plot_avg_methylation_hist(
+    sample_id: str | None = None,
+    *,
+    bins: int = 50,
+    col_wrap: int = 3,
+) -> sns.FacetGrid:
+    plot_df = load_sample_region_context_df(sample_id)
+    plot_df = add_region_calling_tool_labels(plot_df, tool_col="tool")
+    plot_df = plot_df.dropna(subset=["tool_label", "mean_meth"]).copy()
+    col_order = [
+        label
+        for label in _ordered_region_calling_tool_labels()
+        if label in plot_df["tool_label"].astype(str).unique()
+    ]
+
+    grid = sns.displot(
+        data=plot_df,
+        x="mean_meth",
+        col="tool_label",
+        col_order=col_order,
+        col_wrap=col_wrap,
+        bins=bins,
+        stat="density",
+        common_norm=False,
+        facet_kws={"sharex": True, "sharey": True},
+    )
+    grid.set_axis_labels("Average methylation", "Density")
+    grid.set_titles("{col_name}")
+    title_prefix = sample_id if sample_id is not None else "All samples"
+    grid.fig.suptitle(f"{title_prefix}: Average methylation per region by tool", y=1.02)
+    return grid
+
+
+def plot_pairwise_missing(
+    sample_id: str | None = None,
+    *,
+    methyl_seg_only: bool = True,
+    bins: int = 50,
+    col_wrap: int = 3,
+) -> sns.FacetGrid:
+    plot_df = load_sample_pairwise_missing_region_context_df(sample_id)
+    plot_df = add_region_calling_tool_labels(plot_df, tool_col="tool")
+    plot_df = add_region_calling_tool_labels(
+        plot_df,
+        tool_col="other_tool",
+        normalized_col="other_tool_normalized",
+        label_col="other_tool_label",
+    )
+
+    if methyl_seg_only:
+        plot_df = plot_df.loc[_pairwise_missing_methylseg_mask(plot_df)].copy()
+
+    plot_df = plot_df.dropna(subset=["tool_label", "mean_meth", "comparison"]).copy()
+    comparison_ids = sorted(
+        plot_df["comparison"].astype(str).unique().tolist(),
+        key=_comparison_sort_key,
+    )
+    comparison_order = [_comparison_label_from_id(comparison_id) for comparison_id in comparison_ids]
+    plot_df["comparison_label"] = plot_df["comparison"].astype(str).map(
+        _comparison_label_from_id
+    )
+    plot_df["comparison_label"] = pd.Categorical(
+        plot_df["comparison_label"],
+        categories=comparison_order,
+        ordered=True,
+    )
+    plot_df["pairwise_plot_label"] = plot_df.apply(_pairwise_missing_plot_label, axis=1)
+
+    hue_order = [
+        label
+        for label in [
+            PAIRWISE_MISSING_COMPARATOR_LABEL,
+            "MethylSeg WGBS",
+            "MethylSeg HM450K",
+        ]
+        if label in plot_df["pairwise_plot_label"].astype(str).unique()
+    ]
+    palette = {label: PAIRWISE_MISSING_PLOT_COLORS[label] for label in hue_order}
+    grid = sns.displot(
+        data=plot_df,
+        x="mean_meth",
+        col="comparison_label",
+        col_order=comparison_order,
+        hue="pairwise_plot_label",
+        hue_order=hue_order,
+        bins=bins,
+        stat="density",
+        common_norm=False,
+        col_wrap=col_wrap,
+        facet_kws={"sharex": True, "sharey": True},
+        palette=palette,
+    )
+    grid.set_axis_labels("Average methylation", "Density")
+    grid.set_titles("{col_name}")
+    if grid._legend is not None:
+        grid._legend.set_title("Missing-side group")
+    title_prefix = sample_id if sample_id is not None else "All samples"
+    grid.fig.suptitle(
+        f"{title_prefix}: Missing-region methylation by pairwise comparison",
+        y=1.02,
+    )
+    return grid
 
 
 def _load_comparison_matrix(
@@ -988,24 +1860,12 @@ SYNTHETIC_TOOL_LABELS = {
 }
 
 SYNTHETIC_TOOL_COLORS = {
-    "methylseg": "#255f85",
-    "methylseg_hm450k": "#4c956c",
-    "methylseekr": "#c6ac4d",
-    "dnmtools": "#c97c5d",
-    "dnmtools_array": "#d65f5f",
-    "dnmtools_pmr": "#8f5a9c",
-    "mmseekr": "#6c757d",
-    "methyl_lasso": "#3f8f97",
+    tool: TOOL_DISTINCT_COLORS_BY_SLUG[tool]
+    for tool in SYNTHETIC_TOOL_ORDER
 }
 SYNTHETIC_BAR_HIGHLIGHT_COLORS = {
-    "methylseg": "#0b5394",
-    "methylseg_hm450k": "#3d85c6",
-    "methylseekr": "#9aa0a6",
-    "dnmtools": "#9aa0a6",
-    "dnmtools_array": "#9aa0a6",
-    "dnmtools_pmr": "#9aa0a6",
-    "mmseekr": "#9aa0a6",
-    "methyl_lasso": "#9aa0a6",
+    tool: TOOL_HIGHLIGHT_COLORS_BY_SLUG[tool]
+    for tool in SYNTHETIC_TOOL_ORDER
 }
 
 SYNTHETIC_TOOL_RANK = {
@@ -1013,18 +1873,16 @@ SYNTHETIC_TOOL_RANK = {
 }
 
 SYNTHETIC_EXAMPLE_TRACK_COLORS = {
-    "source": "#577590",
-    "cleaned": "#43aa8b",
-    "injected": "#f3722c",
+    **SYNTHETIC_TRACK_COLORS,
 }
 SYNTHETIC_EXAMPLE_TRACK_TITLES = {
     "source": "Original source",
+    "potential": "Potential PMDs",
     "cleaned": "Cleaned background",
     "injected": "Injected synthetic",
 }
 SYNTHETIC_EXAMPLE_INTERVAL_STYLES = {
-    "background": {"fillcolor": "#90be6d", "opacity": 0.16},
-    "injected": {"fillcolor": "#f94144", "opacity": 0.18},
+    **SYNTHETIC_INTERVAL_STYLES,
 }
 SYNTHETIC_READ_CHUNK_SIZE = 1_000_000
 
@@ -1187,6 +2045,9 @@ def plot_synthetic_metric_bar(
     title: str | None = None,
     ylabel: str | None = None,
     tool_col: str = "tool",
+    title_size: int = 18,
+    label_size: int = 14,
+    tick_size: int = 11,
 ) -> plt.Axes:
     plot_df = sort_synthetic_tools(
         per_tool_summary_df,
@@ -1209,7 +2070,7 @@ def plot_synthetic_metric_bar(
         bar_positions,
         plot_df["metric_value"].to_numpy(),
         color=bar_colors,
-        edgecolor="#4f4f4f",
+        edgecolor=NEUTRAL_COLORS["axis_gray"],
         linewidth=0.8,
     )
     ax.set_xticks(bar_positions)
@@ -1218,6 +2079,9 @@ def plot_synthetic_metric_bar(
         ax,
         title or metric_display_name(metric_col),
         ylabel or metric_display_name(metric_col),
+        title_size=title_size,
+        label_size=label_size,
+        tick_size=tick_size,
     )
     ax.grid(axis="y", alpha=0.25)
     return ax
@@ -1232,7 +2096,7 @@ def plot_false_positive_beta_violin(
     ylabel: str = "False-positive region mean beta",
     tool_col: str = "tool",
     value_col: str = "mean_beta",
-    violin_fill_color: str = "#d9d9d9",
+    violin_fill_color: str = ANNOTATION_COLORS["table_header_fill"],
     point_size: int = 9,
     point_alpha: float = 0.18,
     point_jitter: float = 0.12,
@@ -1289,7 +2153,7 @@ def plot_false_positive_beta_violin(
         )
         body = violin["bodies"][0]
         body.set_facecolor(violin_fill_color)
-        body.set_edgecolor("#5f5f5f")
+        body.set_edgecolor(NEUTRAL_COLORS["dark_gray"])
         body.set_alpha(0.8)
         body.set_linewidth(1.0)
         verts = body.get_paths()[0].vertices
@@ -1301,10 +2165,14 @@ def plot_false_positive_beta_violin(
             widths=box_width,
             patch_artist=True,
             showfliers=False,
-            medianprops={"color": "#202020", "linewidth": 1.4},
-            boxprops={"facecolor": "white", "edgecolor": "#404040", "linewidth": 1.0},
-            whiskerprops={"color": "#404040", "linewidth": 1.0},
-            capprops={"color": "#404040", "linewidth": 1.0},
+            medianprops={"color": NEUTRAL_COLORS["black"], "linewidth": 1.4},
+            boxprops={
+                "facecolor": NEUTRAL_COLORS["white"],
+                "edgecolor": NEUTRAL_COLORS["outline_gray"],
+                "linewidth": 1.0,
+            },
+            whiskerprops={"color": NEUTRAL_COLORS["outline_gray"], "linewidth": 1.0},
+            capprops={"color": NEUTRAL_COLORS["outline_gray"], "linewidth": 1.0},
         )
         for patch in box["boxes"]:
             patch.set_zorder(3)
@@ -1754,6 +2622,36 @@ def _compute_plot_keep_idx(
     return keep_idx, True
 
 
+def _subset_beta_track_to_intervals(
+    beta_df: pd.DataFrame,
+    intervals_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if beta_df.empty or intervals_df.empty:
+        return beta_df.iloc[0:0].copy()
+
+    track_df = beta_df.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+    subset_frames = []
+    for chrom_name, chrom_intervals in intervals_df.groupby("chrom", sort=False):
+        chrom_track_df = track_df.loc[track_df["chrom"] == chrom_name].copy()
+        if chrom_track_df.empty:
+            continue
+
+        starts = chrom_track_df["start"].to_numpy(dtype=np.int64)
+        ends = chrom_track_df["end"].to_numpy(dtype=np.int64)
+        keep_mask = np.zeros(len(chrom_track_df), dtype=bool)
+
+        for interval in chrom_intervals.itertuples(index=False):
+            overlap_mask = (starts < int(interval.end)) & (ends > int(interval.start))
+            keep_mask |= overlap_mask
+
+        if keep_mask.any():
+            subset_frames.append(chrom_track_df.loc[keep_mask].copy())
+
+    if not subset_frames:
+        return track_df.iloc[0:0].copy()
+    return pd.concat(subset_frames, ignore_index=True)
+
+
 def plot_synthetic_background_example(
     *,
     background_root: str | Path,
@@ -1812,35 +2710,40 @@ def plot_synthetic_background_example(
         _resolve_synthetic_manifest_entry(injected_row["truth_bed"], injected_manifest),
         chrom,
     )
-
     raw_tracks = {
         "source": source_beta_df.copy(),
+        "potential": source_beta_df.copy(),
         "cleaned": cleaned_beta_df.copy(),
         "injected": injected_beta_df.copy(),
     }
     shared_keep_idx = None
     downsampled = False
-    if _coordinate_aligned_plot_tracks(raw_tracks):
+    aligned_tracks = {
+        "cleaned": cleaned_beta_df.copy(),
+        "injected": injected_beta_df.copy(),
+    }
+    if _coordinate_aligned_plot_tracks(aligned_tracks):
         shared_keep_idx, downsampled = _compute_plot_keep_idx(
-            len(next(iter(raw_tracks.values()))),
+            len(next(iter(aligned_tracks.values()))),
             max_points=max_points,
         )
 
     fig = make_subplots(
-        rows=3,
+        rows=4,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.03,
         subplot_titles=[
             SYNTHETIC_EXAMPLE_TRACK_TITLES["source"],
+            SYNTHETIC_EXAMPLE_TRACK_TITLES["potential"],
             SYNTHETIC_EXAMPLE_TRACK_TITLES["cleaned"],
             SYNTHETIC_EXAMPLE_TRACK_TITLES["injected"],
         ],
     )
 
-    for row_idx, track_name in enumerate(["source", "cleaned", "injected"], start=1):
+    for row_idx, track_name in enumerate(["source", "potential", "cleaned", "injected"], start=1):
         plot_df = raw_tracks[track_name].copy()
-        if shared_keep_idx is not None:
+        if shared_keep_idx is not None and track_name in {"cleaned", "injected"}:
             keep_idx = shared_keep_idx
             track_downsampled = downsampled
         else:
@@ -1885,19 +2788,19 @@ def plot_synthetic_background_example(
     overlay_shapes.extend(
         _interval_overlay_shapes(
             background_truth_df,
-            row=1,
+            row=2,
             **SYNTHETIC_EXAMPLE_INTERVAL_STYLES["background"],
         )
     )
     overlay_shapes.extend(
         _interval_overlay_shapes(
             injected_truth_df,
-            row=3,
+            row=4,
             **SYNTHETIC_EXAMPLE_INTERVAL_STYLES["injected"],
         )
     )
 
-    for row_idx in range(1, 4):
+    for row_idx in range(1, 5):
         fig.update_yaxes(
             range=[0.0, 1.0],
             fixedrange=True,
@@ -1908,17 +2811,17 @@ def plot_synthetic_background_example(
 
     x_min = min(int(df["start"].min()) for df in raw_tracks.values())
     x_max = max(int(df["end"].max()) for df in raw_tracks.values())
-    fig.update_xaxes(title_text="Genomic position", row=3, col=1)
+    fig.update_xaxes(title_text="Genomic position", row=4, col=1)
     fig.update_xaxes(
         range=[x_min, x_max],
         rangeslider={"visible": True},
         showgrid=True,
-        row=3,
+        row=4,
         col=1,
     )
     fig.update_layout(
         template="plotly_white",
-        height=850,
+        height=1050,
         hovermode="x unified",
         shapes=overlay_shapes,
         title=(
@@ -1955,28 +2858,57 @@ LAD_TOOL_LABELS = {
     "mmseekr": "MMSeekR",
     "methyl_lasso": "MethylLasso",
 }
-LAD_TOOL_COLORS = {
-    "methylseg": "#0b5394",
-    "methylseg_hm450k": "#3d85c6",
-    "methylseekr": "#9aa0a6",
-    "dnmtools": "#9aa0a6",
-    "dnmtools_array": "#9aa0a6",
-    "dnmtools_pmr": "#9aa0a6",
-    "mmseekr": "#9aa0a6",
-    "methyl_lasso": "#9aa0a6",
-}
 LAD_METRIC_LABELS = {
     "pct_regions_overlapping_lads": "Fraction of regions overlapping LADs",
     "pct_regions_overlapping_lads_gte_150kb": "Fraction of regions overlapping LADs by at least 150 kb",
     "avg_distance_to_nearest_lad": "Average distance to nearest LAD (bp)",
     "avg_distance_to_nearest_lad_boundary": "Average distance to nearest LAD boundary (bp)",
     "avg_distance_to_nearest_lad_boundary_non_overlapping": "Average distance to nearest LAD boundary for non-overlapping regions (bp)",
+    "avg_lads_per_overlapping_pmd": "Average LAD overlaps per overlapping PMD",
+    "avg_lad_per_pmd": "Average LAD overlaps per PMD",
+    "dist_to_lad": "Distance to LAD (bp)",
+    "dist_to_lad_boundary": "Distance to nearest LAD boundary (bp)",
+    "total_lad_overlap_bp": "Total LAD overlap (bp)",
+    "lad_overlap_fraction": "Fraction of region overlapping LADs",
     "pct_regions_with_boundary_within_150kb_of_lad_boundary": "Fraction of regions with a boundary within 150 kb of a LAD boundary",
     "pct_non_overlapping_regions_within_150kb_of_lad_boundary": "Fraction of non-overlapping regions with a boundary within 150 kb of a LAD boundary",
     "pct_regions_sharing_lad": "Fraction of LAD-overlapping regions sharing a LAD",
     "pmd_coverage_by_lads": "Fraction of region bases covered by LADs",
     "pct_lads_overlapping": "Fraction of LADs overlapping regions",
     "lad_coverage_by_pmds": "Fraction of LAD bases covered by regions",
+    "n_regions": "Number of called regions",
+    "n_lad_regions": "Number of LAD regions",
+}
+LAD_PCA_SCORE_METRICS = [
+    "avg_distance_to_nearest_lad",
+    "avg_distance_to_nearest_lad_boundary",
+    "avg_distance_to_nearest_lad_boundary_non_overlapping",
+    "avg_lads_per_overlapping_pmd",
+    "avg_lad_per_pmd",
+    "lad_coverage_by_pmds",
+    "pct_lads_overlapping",
+    "pct_non_overlapping_regions_within_150kb_of_lad_boundary",
+    "pct_regions_overlapping_lads",
+    "pct_regions_overlapping_lads_gte_150kb",
+    "pct_regions_sharing_lad",
+    "pct_regions_with_boundary_within_150kb_of_lad_boundary",
+    "pmd_coverage_by_lads",
+]
+LAD_PCA_COUNT_FEATURES = ["n_regions", "n_lad_regions"]
+LAD_PCA_METRIC_DIRECTIONS = {
+    "avg_distance_to_nearest_lad": "lower_is_better",
+    "avg_distance_to_nearest_lad_boundary": "lower_is_better",
+    "avg_distance_to_nearest_lad_boundary_non_overlapping": "lower_is_better",
+    "avg_lads_per_overlapping_pmd": "higher_is_better",
+    "avg_lad_per_pmd": "higher_is_better",
+    "lad_coverage_by_pmds": "higher_is_better",
+    "pct_lads_overlapping": "higher_is_better",
+    "pct_non_overlapping_regions_within_150kb_of_lad_boundary": "higher_is_better",
+    "pct_regions_overlapping_lads": "higher_is_better",
+    "pct_regions_overlapping_lads_gte_150kb": "higher_is_better",
+    "pct_regions_sharing_lad": "higher_is_better",
+    "pct_regions_with_boundary_within_150kb_of_lad_boundary": "higher_is_better",
+    "pmd_coverage_by_lads": "higher_is_better",
 }
 
 
@@ -2044,3 +2976,139 @@ def get_lad_sample_genomes_df() -> pd.DataFrame:
 
 def get_lad_reference_summary_df() -> pd.DataFrame:
     return _read_lad_table("lad_reference_summary.tsv")
+
+
+def get_lad_boundary_distance_details_df() -> pd.DataFrame:
+    return _read_lad_table("lad_boundary_distance_details.tsv")
+
+
+def get_lad_region_overlap_details_df() -> pd.DataFrame:
+    return _read_lad_table("lad_region_overlap_details.tsv")
+
+
+def get_lad_metric_feature_matrix_df(
+    metrics_df: pd.DataFrame | None = None,
+    *,
+    region_type: str | None = None,
+    score_metrics: list[str] | None = None,
+    count_features: list[str] | None = None,
+) -> pd.DataFrame:
+    source_df = get_lad_association_metrics_df() if metrics_df is None else metrics_df.copy()
+    if source_df.empty:
+        raise ValueError("No LAD association metrics are available for PCA.")
+
+    source_df = add_lad_tool_labels(apply_lad_tool_order(source_df))
+    if region_type is not None:
+        source_df = source_df.loc[
+            source_df["region_type"].astype(str) == str(region_type)
+        ].copy()
+    if source_df.empty:
+        raise ValueError(f"No LAD association metrics remain after region_type={region_type!r} filtering.")
+
+    selected_score_metrics = list(
+        LAD_PCA_SCORE_METRICS if score_metrics is None else score_metrics
+    )
+    selected_count_features = list(
+        LAD_PCA_COUNT_FEATURES if count_features is None else count_features
+    )
+    available_metrics = set(source_df["metric"].astype(str))
+    missing_metrics = [
+        metric_name for metric_name in selected_score_metrics if metric_name not in available_metrics
+    ]
+    if missing_metrics:
+        raise ValueError(
+            "Missing LAD metrics required for PCA: " + ", ".join(missing_metrics)
+        )
+
+    missing_count_features = [
+        feature_name
+        for feature_name in selected_count_features
+        if feature_name not in source_df.columns
+    ]
+    if missing_count_features:
+        raise ValueError(
+            "Missing LAD count features required for PCA: "
+            + ", ".join(missing_count_features)
+        )
+
+    id_cols = [
+        "sample",
+        "sample_id",
+        "tool",
+        "tool_label",
+        "platform",
+        "region_type",
+    ]
+    metrics_subset_df = source_df.loc[
+        source_df["metric"].astype(str).isin(selected_score_metrics),
+        id_cols + ["metric", "score", *selected_count_features],
+    ].copy()
+
+    count_nunique_df = metrics_subset_df.groupby(
+        id_cols,
+        observed=True,
+        sort=False,
+    )[selected_count_features].nunique(dropna=False)
+    inconsistent_counts = [
+        f"{group_key}::{feature_name}"
+        for group_key, row in count_nunique_df.iterrows()
+        for feature_name, unique_count in row.items()
+        if unique_count > 1
+    ]
+    if inconsistent_counts:
+        raise ValueError(
+            "Inconsistent LAD count features across metrics for: "
+            + ", ".join(inconsistent_counts[:5])
+        )
+
+    wide_scores_df = (
+        metrics_subset_df.pivot_table(
+            index=id_cols,
+            columns="metric",
+            values="score",
+            aggfunc="first",
+            observed=True,
+        )
+        .reset_index()
+    )
+    wide_scores_df.columns.name = None
+
+    counts_df = (
+        metrics_subset_df[id_cols + selected_count_features]
+        .drop_duplicates(subset=id_cols)
+        .reset_index(drop=True)
+    )
+    feature_matrix_df = wide_scores_df.merge(
+        counts_df,
+        on=id_cols,
+        how="left",
+        validate="one_to_one",
+    )
+
+    missing_feature_columns = [
+        feature_name
+        for feature_name in [*selected_score_metrics, *selected_count_features]
+        if feature_name not in feature_matrix_df.columns
+    ]
+    if missing_feature_columns:
+        raise ValueError(
+            "LAD PCA feature matrix is missing expected columns: "
+            + ", ".join(missing_feature_columns)
+        )
+
+    ordered_cols = id_cols + selected_score_metrics + selected_count_features
+    feature_matrix_df = feature_matrix_df.loc[:, ordered_cols].copy()
+    for feature_name in selected_score_metrics + selected_count_features:
+        feature_matrix_df[feature_name] = pd.to_numeric(
+            feature_matrix_df[feature_name],
+            errors="coerce",
+        )
+
+    feature_matrix_df = add_lad_tool_labels(
+        apply_lad_tool_order(feature_matrix_df)
+    )
+    feature_matrix_df = feature_matrix_df.sort_values(
+        ["tool", "sample"],
+        kind="stable",
+    ).reset_index(drop=True)
+    return feature_matrix_df

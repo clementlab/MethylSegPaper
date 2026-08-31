@@ -5,8 +5,11 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
 SCRDIR="$REPO_ROOT/results/01_region_calling_analysis"
+HMM_RESULTS_DIR="$SCRDIR/hmm_tests"
 ARRAY_SLURM="$SCRIPT_DIR/methylation_comparator.slurm"
 AGGREGATE_SLURM="$SCRIPT_DIR/methylation_aggregator.slurm"
+HMM_ARRAY_SLURM="$SCRIPT_DIR/methylation_hmm_test.slurm"
+HMM_AGGREGATE_SLURM="$SCRIPT_DIR/methylation_hmm_aggregator.slurm"
 CONFIG_SOURCE="$SCRIPT_DIR/configs.txt"
 RUNTIME_CONFIGS="$SCRDIR/configs_runtime.txt"
 
@@ -14,13 +17,14 @@ mkdir -p "$SCRDIR"
 
 ts=$(date +%s)
 
-for run_dir in comparison dnmtools methyl_lasso methylseekr methylseg mmseekr aggregate_summaries logs; do
+for run_dir in comparison dnmtools methyl_lasso methylseekr methylseg mmseekr aggregate_summaries logs hmm_tests; do
   if [ -d "$SCRDIR/$run_dir" ]; then
     mv "$SCRDIR/$run_dir" "$SCRDIR/${run_dir}_backup_$ts"
   fi
 done
 
 mkdir -p "$SCRDIR/logs"
+mkdir -p "$HMM_RESULTS_DIR/logs"
 cd "$SCRDIR"
 
 python - "$CONFIG_SOURCE" "$SCRIPT_DIR/configs" "$RUNTIME_CONFIGS" <<'PY'
@@ -77,6 +81,19 @@ aggregate_job_id=$(sbatch --parsable \
   --job-name=aggregate_${ts} \
   --dependency=afterok:${array_job_id} "$AGGREGATE_SLURM")
 
-echo "Submitted comparator array job: $array_job_id"
+hmm_array_job_id=$(sbatch --parsable \
+  --chdir="$HMM_RESULTS_DIR" \
+  --export=ALL,CONFIGS_FILE="$RUNTIME_CONFIGS",HMM_RESULTS_DIR="$HMM_RESULTS_DIR",HMM_PIPELINE_SCRIPT="$SCRIPT_DIR/run_hmm_test.py" \
+  --job-name=hmm_array_${ts} \
+  --array=1-$N "$HMM_ARRAY_SLURM")
 
+hmm_aggregate_job_id=$(sbatch --parsable \
+  --chdir="$HMM_RESULTS_DIR" \
+  --export=ALL,CONFIGS_FILE="$RUNTIME_CONFIGS",HMM_RESULTS_DIR="$HMM_RESULTS_DIR",HMM_AGGREGATOR_SCRIPT="$SCRIPT_DIR/run_hmm_aggregator.py" \
+  --job-name=hmm_aggregate_${ts} \
+  --dependency=afterok:${hmm_array_job_id} "$HMM_AGGREGATE_SLURM")
+
+echo "Submitted comparator array job: $array_job_id"
 echo "Submitted aggregate job: $aggregate_job_id"
+echo "Submitted HMM array job: $hmm_array_job_id"
+echo "Submitted HMM aggregate job: $hmm_aggregate_job_id"

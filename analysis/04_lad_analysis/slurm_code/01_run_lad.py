@@ -12,6 +12,9 @@ def _load_target_module():
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load LAD runner from {TARGET_PATH}")
     module = module_from_spec(spec)
+    # Register the dynamically loaded module so multiprocessing can pickle
+    # worker functions by resolving their module name.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 

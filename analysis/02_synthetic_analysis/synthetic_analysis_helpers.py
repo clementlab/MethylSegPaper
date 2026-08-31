@@ -2090,6 +2090,7 @@ def compute_region_metrics(
 
 
 def _compute_fragmentation_absorption_from_pairs(pair_df, truth_ids, recall_ids):
+    truth_counts = np.array([], dtype=float)
     if truth_ids:
         truth_counts = np.zeros(len(truth_ids), dtype=float)
         if not pair_df.empty:
@@ -2097,10 +2098,16 @@ def _compute_fragmentation_absorption_from_pairs(pair_df, truth_ids, recall_ids)
             counts = pair_df.loc[pair_df["hit_any"]].groupby("truth_id")["recall_id"].nunique()
             for truth_id, count in counts.items():
                 truth_counts[truth_order[truth_id]] = float(count)
-        fragmentation = float(truth_counts.mean())
+        absolute_fragmentation = float(truth_counts.mean())
+        recalled_truth_counts = truth_counts[truth_counts > 0]
+        fragmentation = (
+            float(recalled_truth_counts.mean()) if recalled_truth_counts.size else np.nan
+        )
     else:
         fragmentation = np.nan
+        absolute_fragmentation = np.nan
 
+    recall_counts = np.array([], dtype=float)
     if recall_ids:
         recall_counts = np.zeros(len(recall_ids), dtype=float)
         if not pair_df.empty:
@@ -2108,9 +2115,16 @@ def _compute_fragmentation_absorption_from_pairs(pair_df, truth_ids, recall_ids)
             counts = pair_df.loc[pair_df["hit_any"]].groupby("recall_id")["truth_id"].nunique()
             for recall_id, count in counts.items():
                 recall_counts[recall_order[recall_id]] = float(count)
-        absorption = float(recall_counts.mean())
+        absolute_absorption = float(recall_counts.mean())
+        overlapping_recall_counts = recall_counts[recall_counts > 0]
+        absorption = (
+            float(overlapping_recall_counts.mean())
+            if overlapping_recall_counts.size
+            else np.nan
+        )
     else:
         absorption = np.nan
+        absolute_absorption = np.nan
 
     return {
         "fragmentation": fragmentation,
@@ -2120,6 +2134,14 @@ def _compute_fragmentation_absorption_from_pairs(pair_df, truth_ids, recall_ids)
         else np.nan,
         "absorption_distance_from_1": abs(absorption - 1.0)
         if not pd.isna(absorption)
+        else np.nan,
+        "absolute_fragmentation": absolute_fragmentation,
+        "absolute_absorption": absolute_absorption,
+        "absolute_fragmentation_distance_from_1": abs(absolute_fragmentation - 1.0)
+        if not pd.isna(absolute_fragmentation)
+        else np.nan,
+        "absolute_absorption_distance_from_1": abs(absolute_absorption - 1.0)
+        if not pd.isna(absolute_absorption)
         else np.nan,
     }
 
@@ -2283,6 +2305,10 @@ def metric_column_names():
             "absorption",
             "fragmentation_distance_from_1",
             "absorption_distance_from_1",
+            "absolute_fragmentation",
+            "absolute_absorption",
+            "absolute_fragmentation_distance_from_1",
+            "absolute_absorption_distance_from_1",
             "avg_false_pmd_beta",
             "mean_false_pmds_called",
         ]

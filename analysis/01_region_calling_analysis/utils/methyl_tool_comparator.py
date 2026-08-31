@@ -59,22 +59,26 @@ CANONICAL_CHROMS = frozenset(
 @dataclass(frozen=True)
 class SharedPrepArtifacts:
     wgbs_tsv: Path
-    hm450k_bed: Path
-    wgbs_450k_intersect_tsv: Path
+    hm450k_bed: Path | None
+    wgbs_450k_intersect_tsv: Path | None
     wgbs_beta: Path
-    hm450k_beta: Path
+    hm450k_beta: Path | None
     wgbs_meth_ref: Path
-    hm450k_meth_ref: Path
+    hm450k_meth_ref: Path | None
 
     def all_paths(self) -> tuple[Path, ...]:
-        return (
-            self.wgbs_tsv,
-            self.hm450k_bed,
-            self.wgbs_450k_intersect_tsv,
-            self.wgbs_beta,
-            self.hm450k_beta,
-            self.wgbs_meth_ref,
-            self.hm450k_meth_ref,
+        return tuple(
+            path
+            for path in (
+                self.wgbs_tsv,
+                self.hm450k_bed,
+                self.wgbs_450k_intersect_tsv,
+                self.wgbs_beta,
+                self.hm450k_beta,
+                self.wgbs_meth_ref,
+                self.hm450k_meth_ref,
+            )
+            if path is not None
         )
 
 
@@ -704,6 +708,8 @@ class SharedPrepManager(MicroArrayPathway):
         out_dir,
         force_recreate: bool = False,
         print_logs: bool = True,
+        skip_450k: bool = False,
+
     ):
         super().__init__(
             sample_id,
@@ -714,6 +720,7 @@ class SharedPrepManager(MicroArrayPathway):
             print_logs,
             shared_prep=None,
         )
+        self.skip_450k = skip_450k
         self.shared_prep_dir = Path(self.out_dir) / self.sample_id / "shared_prep"
         self._outputs: SharedPrepArtifacts | None = None
 
@@ -731,29 +738,37 @@ class SharedPrepManager(MicroArrayPathway):
         self._write_log(f"Building shared prep artifacts in {shared_dir}")
 
         wgbs_tsv = self._create_readable_meth_file(shared_dir / "wgbs.tsv")
-        hm450k_bed = self._create_hm450k_bed(
-            shared_dir / f"HM450K_{self.genome}_locations.bed"
-        )
-        wgbs_450k_intersect_tsv = self._bedtools_intersect_450k(
-            wgbs_tsv,
-            hm450k_bed,
-            shared_dir / "wgbs_450k_intersect.tsv",
-        )
         wgbs_beta = self._wgbs_cov_to_beta_file(wgbs_tsv, shared_dir / "wgbs.beta")
-        hm450k_beta = self._format_intersect_as_450k_beta(
-            wgbs_450k_intersect_tsv,
-            shared_dir / "450k.beta",
-        )
         wgbs_meth_ref = self._make_meth_ref(
             wgbs_tsv,
             shared_dir / "wgbs_meth_ref.tsv",
             resolution="wgbs",
         )
-        hm450k_meth_ref = self._make_meth_ref(
-            hm450k_beta,
-            shared_dir / "450k_meth_ref.tsv",
-            resolution="450k",
-        )
+
+        if not self.skip_450k:
+            hm450k_bed = self._create_hm450k_bed(
+                shared_dir / f"HM450K_{self.genome}_locations.bed"
+            )
+            wgbs_450k_intersect_tsv = self._bedtools_intersect_450k(
+                wgbs_tsv,
+                hm450k_bed,
+                shared_dir / "wgbs_450k_intersect.tsv",
+            )
+            hm450k_beta = self._format_intersect_as_450k_beta(
+                wgbs_450k_intersect_tsv,
+                shared_dir / "450k.beta",
+            )
+            
+            hm450k_meth_ref = self._make_meth_ref(
+                hm450k_beta,
+                shared_dir / "450k_meth_ref.tsv",
+                resolution="450k",
+            )
+        else:
+            hm450k_bed = None
+            wgbs_450k_intersect_tsv = None
+            hm450k_beta = None
+            hm450k_meth_ref = None
 
         self._outputs = SharedPrepArtifacts(
             wgbs_tsv=wgbs_tsv,
@@ -2444,6 +2459,400 @@ class MethylToolComparator:
             "mmseekr": bt_mmseekr,
         }
 
+    @staticmethod
+    def _region_type_for_tool(tool_name: str) -> str:
+        if "pmr" in str(tool_name).lower():
+            return "PMR"
+        return "PMD"
+
+    @staticmethod
+    def _platform_for_tool(tool_name: str) -> str:
+        if tool_name in {"dnmtools_array", "methylseg_hm450k"}:
+            return "hm450k"
+        return "wgbs"
+
+    @staticmethod
+    def _should_include_pairwise_missing_comparison(
+        tool_a: str, tool_b: str, methyl_seg_only: bool = True
+    ) -> bool:
+        if not methyl_seg_only:
+            return True
+
+        methylseg_tools = {"methylseg_wgbs", "methylseg_hm450k"}
+        return len({tool_a, tool_b} & methylseg_tools) == 1
+
+    def _build_methylseg_platform_context_data(self, platform: str) -> dict:
+        methylseg_out_dir = (
+            Path(self.pathways["MethylSeg"].out_dir) / self.sample_id / "out" / platform
+        )
+        meth_ref_name = "450k_meth_ref.tsv" if platform == "hm450k" else "wgbs_meth_ref.tsv"
+        meth_ref_path = (
+            Path(self.pathways["MethylSeg"].out_dir) / self.sample_id / "prep" / meth_ref_name
+        )
+
+        meth_by_chrom: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        if meth_ref_path.exists():
+            meth_df = pd.read_csv(meth_ref_path, sep="\t")
+            meth_df.columns = ["CpG_chrm", "CpG_beg", "CpG_end", "beta"]
+            meth_df = meth_df.sort_values(["CpG_chrm", "CpG_beg"])
+            for chrom, chrom_df in meth_df.groupby("CpG_chrm", sort=False):
+                meth_by_chrom[chrom] = (
+                    chrom_df["CpG_beg"].to_numpy(dtype=np.int64),
+                    chrom_df["beta"].to_numpy(dtype=float),
+                )
+
+        state_intervals: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+        for state in MethylationStates._member_names_:
+            state_file = methylseg_out_dir / "summary_files" / f"segments_cleaned_{state}.bed"
+            if state_file.exists() and state_file.stat().st_size > 0:
+                state_df = pd.read_csv(
+                    state_file,
+                    sep="\t",
+                    header=None,
+                    names=["chr", "start", "end", "label"],
+                )
+            else:
+                state_df = pd.DataFrame(columns=["chr", "start", "end", "label"])
+            if not state_df.empty:
+                state_df = state_df.sort_values(["chr", "start", "end"]).reset_index(drop=True)
+
+            chrom_intervals: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+            if not state_df.empty:
+                for chrom, chrom_df in state_df.groupby("chr", sort=False):
+                    chrom_intervals[chrom] = (
+                        chrom_df["start"].to_numpy(dtype=np.int64),
+                        chrom_df["end"].to_numpy(dtype=np.int64),
+                    )
+            state_intervals[state] = chrom_intervals
+
+        return {
+            "meth_by_chrom": meth_by_chrom,
+            "state_intervals": state_intervals,
+        }
+
+    def _build_region_context_platform_data(
+        self,
+    ) -> tuple[dict[str, dict[str, object]], float, float]:
+        platform_data = {
+            "wgbs": self._build_methylseg_platform_context_data("wgbs"),
+            "hm450k": self._build_methylseg_platform_context_data("hm450k"),
+        }
+        methylseg_pathway = self.pathways["MethylSeg"]
+        int_low_cutoff = float(methylseg_pathway.int_low_cutoff)
+        int_high_cutoff = float(methylseg_pathway.int_high_cutoff)
+        return platform_data, int_low_cutoff, int_high_cutoff
+
+    def _interval_df_from_state_intervals(
+        self, state_intervals: dict[str, tuple[np.ndarray, np.ndarray]]
+    ) -> pd.DataFrame:
+        rows = []
+        for chrom, (starts, ends) in state_intervals.items():
+            if starts.size == 0:
+                continue
+            rows.append(pd.DataFrame({"chr": chrom, "start": starts, "end": ends}))
+        if not rows:
+            return pd.DataFrame(columns=["chr", "start", "end"])
+        return pd.concat(rows, ignore_index=True)
+
+    def _build_region_context_specs(
+        self, platform_data: dict[str, dict[str, object]]
+    ) -> list[dict[str, object]]:
+        specs: list[dict[str, object]] = [
+            {
+                "tool": tool_name,
+                "platform": self._platform_for_tool(tool_name),
+                "region_type": self._region_type_for_tool(tool_name),
+                "region_df": region_df.loc[:, ["chr", "start", "end"]].copy(),
+            }
+            for tool_name, region_df in self.region_dfs.items()
+        ]
+
+        for platform in ["wgbs", "hm450k"]:
+            specs.append(
+                {
+                    "tool": f"methylseg_{platform}",
+                    "platform": platform,
+                    "region_type": "PMD",
+                    "region_df": self._interval_df_from_state_intervals(
+                        platform_data[platform]["state_intervals"]["PMD"]
+                    ),
+                }
+            )
+
+        return specs
+
+    def _subtract_region_dfs(
+        self, left_df: pd.DataFrame, right_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        left_coords = left_df.loc[:, ["chr", "start", "end"]].copy()
+        right_coords = right_df.loc[:, ["chr", "start", "end"]].copy()
+        if left_coords.empty:
+            return pd.DataFrame(columns=["chr", "start", "end"])
+
+        left_coords = self._ensure_3cols(
+            left_coords.sort_values(["chr", "start", "end"]).reset_index(drop=True)
+        )
+        if right_coords.empty:
+            return left_coords
+
+        right_coords = self._ensure_3cols(
+            right_coords.sort_values(["chr", "start", "end"]).reset_index(drop=True)
+        )
+        unique_rows: list[tuple[str, int, int]] = []
+
+        right_by_chrom = {
+            chrom: chrom_df.loc[:, ["start", "end"]].to_numpy(dtype=np.int64)
+            for chrom, chrom_df in right_coords.groupby("chr", sort=False)
+        }
+
+        for chrom, chrom_df in left_coords.groupby("chr", sort=False):
+            blockers = right_by_chrom.get(chrom)
+            if blockers is None or blockers.size == 0:
+                unique_rows.extend(
+                    [
+                        (str(chrom), int(row.start), int(row.end))
+                        for row in chrom_df.itertuples(index=False)
+                    ]
+                )
+                continue
+
+            for row in chrom_df.itertuples(index=False):
+                segments = [(int(row.start), int(row.end))]
+                if row.end <= row.start:
+                    continue
+
+                for block_start, block_end in blockers:
+                    if not segments:
+                        break
+                    if block_end <= row.start:
+                        continue
+                    if block_start >= row.end:
+                        break
+
+                    next_segments: list[tuple[int, int]] = []
+                    for seg_start, seg_end in segments:
+                        if block_end <= seg_start or block_start >= seg_end:
+                            next_segments.append((seg_start, seg_end))
+                            continue
+                        if block_start > seg_start:
+                            next_segments.append((seg_start, min(int(block_start), seg_end)))
+                        if block_end < seg_end:
+                            next_segments.append((max(int(block_end), seg_start), seg_end))
+                    segments = [
+                        (seg_start, seg_end)
+                        for seg_start, seg_end in next_segments
+                        if seg_end > seg_start
+                    ]
+
+                unique_rows.extend(
+                    [(str(chrom), seg_start, seg_end) for seg_start, seg_end in segments]
+                )
+
+        if not unique_rows:
+            return pd.DataFrame(columns=["chr", "start", "end"])
+
+        unique_df = pd.DataFrame(unique_rows, columns=["chr", "start", "end"])
+        return self._ensure_3cols(unique_df)
+
+    def _build_pairwise_missing_context_specs(
+        self,
+        *,
+        methyl_seg_only: bool = True,
+    ) -> list[dict[str, object]]:
+        tool_order = [
+            "methylseg_wgbs",
+            "methylseg_hm450k",
+            "methylseekr",
+            "dnmtools",
+            "dnmtools_array",
+            "dnmtools_pmr",
+            "mmseekr",
+            "methylasso",
+        ]
+        available_tools = [tool for tool in tool_order if tool in self.region_dfs]
+        specs: list[dict[str, object]] = []
+
+        for idx, tool_a in enumerate(available_tools):
+            for tool_b in available_tools[idx + 1 :]:
+                if not self._should_include_pairwise_missing_comparison(
+                    tool_a, tool_b, methyl_seg_only=methyl_seg_only
+                ):
+                    continue
+
+                comparison = f"{tool_a} vs {tool_b}"
+                unique_a = self._subtract_region_dfs(
+                    self.region_dfs[tool_a],
+                    self.region_dfs[tool_b],
+                )
+                unique_b = self._subtract_region_dfs(
+                    self.region_dfs[tool_b],
+                    self.region_dfs[tool_a],
+                )
+
+                specs.append(
+                    {
+                        "comparison": comparison,
+                        "tool": tool_a,
+                        "other_tool": tool_b,
+                        "platform": self._platform_for_tool(tool_a),
+                        "region_df": unique_a,
+                    }
+                )
+                specs.append(
+                    {
+                        "comparison": comparison,
+                        "tool": tool_b,
+                        "other_tool": tool_a,
+                        "platform": self._platform_for_tool(tool_b),
+                        "region_df": unique_b,
+                    }
+                )
+
+        return specs
+
+    def _summarize_region_context_specs(
+        self,
+        region_specs: Sequence[dict[str, object]],
+        platform_data: dict[str, dict[str, object]],
+        *,
+        int_low_cutoff: float,
+        int_high_cutoff: float,
+        include_region_type: bool = True,
+    ) -> pd.DataFrame:
+        base_columns = [
+            "sample_id",
+            "tool",
+            "platform",
+            "chrom",
+            "start",
+            "end",
+            "region_length_bp",
+            "n_cpg",
+            "mean_meth",
+            "median_meth",
+            "meth_std",
+            "n_low_cpg",
+            "n_intermediate_cpg",
+            "n_high_cpg",
+            "pct_low",
+            "pct_intermediate",
+            "pct_high",
+        ]
+        if include_region_type:
+            columns = base_columns[:3] + ["region_type"] + base_columns[3:]
+        else:
+            columns = [
+                "sample_id",
+                "comparison",
+                "tool",
+                "other_tool",
+                "platform",
+                "chrom",
+                "start",
+                "end",
+                "region_length_bp",
+                "n_cpg",
+                "mean_meth",
+                "median_meth",
+                "meth_std",
+                "n_low_cpg",
+                "n_intermediate_cpg",
+                "n_high_cpg",
+                "pct_low",
+                "pct_intermediate",
+                "pct_high",
+            ]
+
+        context_records = []
+        for spec in region_specs:
+            region_df = pd.DataFrame(spec["region_df"]).copy()
+            if region_df.empty:
+                continue
+
+            platform = str(spec["platform"])
+            meth_by_chrom = platform_data[platform]["meth_by_chrom"]
+            tool_name = str(spec["tool"])
+
+            tool_df = region_df.rename(columns={"chrom": "chr"}).loc[:, ["chr", "start", "end"]]
+            tool_df["start"] = tool_df["start"].astype(np.int64)
+            tool_df["end"] = tool_df["end"].astype(np.int64)
+            tool_df = tool_df.sort_values(["chr", "start", "end"]).reset_index(drop=True)
+
+            extra_record_fields = {}
+            if include_region_type:
+                extra_record_fields["region_type"] = str(
+                    spec.get("region_type", self._region_type_for_tool(tool_name))
+                )
+            else:
+                extra_record_fields["comparison"] = str(spec["comparison"])
+                extra_record_fields["other_tool"] = str(spec["other_tool"])
+
+            for chrom, chrom_df in tool_df.groupby("chr", sort=False):
+                starts = chrom_df["start"].to_numpy(dtype=np.int64)
+                ends = chrom_df["end"].to_numpy(dtype=np.int64)
+                lengths = np.clip(ends - starts, a_min=0, a_max=None)
+
+                meth_positions, meth_values = meth_by_chrom.get(
+                    chrom,
+                    (np.array([], dtype=np.int64), np.array([], dtype=float)),
+                )
+                left_idx = np.searchsorted(meth_positions, starts, side="left")
+                right_idx = np.searchsorted(meth_positions, ends, side="left")
+
+                for idx, (region_start, region_end, region_len) in enumerate(
+                    zip(starts, ends, lengths)
+                ):
+                    meth_slice = meth_values[left_idx[idx] : right_idx[idx]]
+                    n_cpg = int(meth_slice.size)
+                    meth_std = (
+                        float(np.std(meth_slice, ddof=1))
+                        if meth_slice.size > 1
+                        else np.nan
+                    )
+
+                    low_mask = meth_slice < int_low_cutoff
+                    intermediate_mask = (meth_slice >= int_low_cutoff) & (
+                        meth_slice <= int_high_cutoff
+                    )
+                    high_mask = meth_slice > int_high_cutoff
+
+                    n_low_cpg = int(low_mask.sum())
+                    n_intermediate_cpg = int(intermediate_mask.sum())
+                    n_high_cpg = int(high_mask.sum())
+
+                    context_records.append(
+                        {
+                            "sample_id": self.sample_id,
+                            "tool": tool_name,
+                            "platform": platform,
+                            "chrom": chrom,
+                            "start": int(region_start),
+                            "end": int(region_end),
+                            "region_length_bp": int(region_len),
+                            "n_cpg": n_cpg,
+                            "mean_meth": (
+                                float(meth_slice.mean()) if meth_slice.size else np.nan
+                            ),
+                            "median_meth": (
+                                float(np.median(meth_slice)) if meth_slice.size else np.nan
+                            ),
+                            "meth_std": meth_std,
+                            "n_low_cpg": n_low_cpg,
+                            "n_intermediate_cpg": n_intermediate_cpg,
+                            "n_high_cpg": n_high_cpg,
+                            "pct_low": (n_low_cpg * 100.0 / n_cpg if n_cpg else np.nan),
+                            "pct_intermediate": (
+                                n_intermediate_cpg * 100.0 / n_cpg if n_cpg else np.nan
+                            ),
+                            "pct_high": (
+                                n_high_cpg * 100.0 / n_cpg if n_cpg else np.nan
+                            ),
+                            **extra_record_fields,
+                        }
+                    )
+
+        return pd.DataFrame(context_records, columns=columns)
+
     def _parse_genome_coverage_pct(self, bt: BedTool, genome: str) -> float:
         """
         Parse genome coverage percentage from pybedtools genome_coverage(hist=True).
@@ -3123,119 +3532,31 @@ class MethylToolComparator:
         run_stats_out = aggregate_summaries / "all_run_stats.csv"
         region_stats_out = aggregate_summaries / "all_region_stats.csv"
         region_context_out = aggregate_summaries / "all_region_context_stats.csv"
+        pairwise_missing_context_out = (
+            aggregate_summaries / "all_pairwise_missing_region_context_stats.csv"
+        )
 
         if (
             run_stats_out.exists()
             and region_stats_out.exists()
             and region_context_out.exists()
+            and pairwise_missing_context_out.exists()
             and not self.force_recreate
         ):
             return {
                 "all_run_stats": str(run_stats_out),
                 "all_region_stats": str(region_stats_out),
                 "all_region_context_stats": str(region_context_out),
+                "all_pairwise_missing_region_context_stats": str(
+                    pairwise_missing_context_out
+                ),
             }
 
         if not hasattr(self, "region_dfs"):
             self._load_regions()
-
-        def _build_methylseg_platform_data(platform: str) -> dict:
-            methylseg_out_dir = (
-                Path(self.pathways["MethylSeg"].out_dir)
-                / self.sample_id
-                / "out"
-                / platform
-            )
-            meth_ref_name = (
-                "450k_meth_ref.tsv" if platform == "hm450k" else "wgbs_meth_ref.tsv"
-            )
-            meth_ref_path = (
-                Path(self.pathways["MethylSeg"].out_dir)
-                / self.sample_id
-                / "prep"
-                / meth_ref_name
-            )
-
-            meth_by_chrom: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-            if meth_ref_path.exists():
-                meth_df = pd.read_csv(meth_ref_path, sep="\t")
-                meth_df.columns = ["CpG_chrm", "CpG_beg", "CpG_end", "beta"]
-                meth_df = meth_df.sort_values(["CpG_chrm", "CpG_beg"])
-                for chrom, chrom_df in meth_df.groupby("CpG_chrm", sort=False):
-                    meth_by_chrom[chrom] = (
-                        chrom_df["CpG_beg"].to_numpy(dtype=np.int64),
-                        chrom_df["beta"].to_numpy(dtype=float),
-                    )
-
-            state_intervals: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
-            for state in MethylationStates._member_names_:
-                state_file = (
-                    methylseg_out_dir
-                    / "summary_files"
-                    / f"segments_cleaned_{state}.bed"
-                )
-                if state_file.exists() and state_file.stat().st_size > 0:
-                    state_df = pd.read_csv(
-                        state_file,
-                        sep="\t",
-                        header=None,
-                        names=["chr", "start", "end", "label"],
-                    )
-                else:
-                    state_df = pd.DataFrame(columns=["chr", "start", "end", "label"])
-                if not state_df.empty:
-                    state_df = state_df.sort_values(
-                        ["chr", "start", "end"]
-                    ).reset_index(drop=True)
-
-                chrom_intervals: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-                if not state_df.empty:
-                    for chrom, chrom_df in state_df.groupby("chr", sort=False):
-                        chrom_intervals[chrom] = (
-                            chrom_df["start"].to_numpy(dtype=np.int64),
-                            chrom_df["end"].to_numpy(dtype=np.int64),
-                        )
-                state_intervals[state] = chrom_intervals
-
-            return {
-                "meth_by_chrom": meth_by_chrom,
-                "state_intervals": state_intervals,
-            }
-
-        def _region_type_for_tool(tool_name: str) -> str:
-            if "pmr" in tool_name.lower():
-                return "PMR"
-            return "PMD"
-
-        def _platform_for_tool(tool_name: str) -> str:
-            if tool_name in {"dnmtools_array", "methylseg_hm450k"}:
-                return "hm450k"
-            return "wgbs"
-
-        def _get_overlap_bp(
-            start: int,
-            end: int,
-            interval_starts: np.ndarray,
-            interval_ends: np.ndarray,
-        ) -> int:
-            if interval_starts.size == 0 or end <= start:
-                return 0
-            left = np.searchsorted(interval_ends, start, side="right")
-            right = np.searchsorted(interval_starts, end, side="left")
-            if right <= left:
-                return 0
-            overlap_starts = np.maximum(interval_starts[left:right], start)
-            overlap_ends = np.minimum(interval_ends[left:right], end)
-            overlaps = np.clip(overlap_ends - overlap_starts, a_min=0, a_max=None)
-            return int(overlaps.sum())
-
-        platform_data = {
-            "wgbs": _build_methylseg_platform_data("wgbs"),
-            "hm450k": _build_methylseg_platform_data("hm450k"),
-        }
-        methylseg_pathway = self.pathways["MethylSeg"]
-        int_low_cutoff = float(methylseg_pathway.int_low_cutoff)
-        int_high_cutoff = float(methylseg_pathway.int_high_cutoff)
+        platform_data, int_low_cutoff, int_high_cutoff = (
+            self._build_region_context_platform_data()
+        )
 
         run_stat_frames = []
         for tool_name, pathway in self.pathways.items():
@@ -3285,137 +3606,30 @@ class MethylToolComparator:
         region_stats_df["source_file"] = str(region_stats_file)
         region_stats_df.to_csv(region_stats_out, index=False)
 
-        region_context_frames = {
-            name: df.copy() for name, df in self.region_dfs.items()
-        }
-
-        for platform in ["wgbs", "hm450k"]:
-            pmd_intervals = platform_data[platform]["state_intervals"]["PMD"]
-            pmd_rows = []
-            for chrom, (starts, ends) in pmd_intervals.items():
-                if starts.size == 0:
-                    continue
-                pmd_rows.append(
-                    pd.DataFrame(
-                        {
-                            "chr": chrom,
-                            "start": starts,
-                            "end": ends,
-                        }
-                    )
-                )
-            region_context_frames[f"methylseg_{platform}"] = (
-                pd.concat(pmd_rows, ignore_index=True)
-                if pmd_rows
-                else pd.DataFrame(columns=["chr", "start", "end"])
-            )
-
-        context_columns = [
-            "sample_id",
-            "tool",
-            "platform",
-            "region_type",
-            "chrom",
-            "start",
-            "end",
-            "region_length_bp",
-            "n_cpg",
-            "mean_meth",
-            "median_meth",
-            "meth_std",
-            "n_low_cpg",
-            "n_intermediate_cpg",
-            "n_high_cpg",
-            "pct_low",
-            "pct_intermediate",
-            "pct_high",
-        ]
-        context_records = []
-        for tool_name, region_df in region_context_frames.items():
-            if region_df.empty:
-                continue
-
-            platform = _platform_for_tool(tool_name)
-            meth_by_chrom = platform_data[platform]["meth_by_chrom"]
-            tool_df = region_df.loc[:, ["chr", "start", "end"]].copy()
-            tool_df["start"] = tool_df["start"].astype(np.int64)
-            tool_df["end"] = tool_df["end"].astype(np.int64)
-            tool_df = tool_df.sort_values(["chr", "start", "end"]).reset_index(
-                drop=True
-            )
-
-            for chrom, chrom_df in tool_df.groupby("chr", sort=False):
-                starts = chrom_df["start"].to_numpy(dtype=np.int64)
-                ends = chrom_df["end"].to_numpy(dtype=np.int64)
-                lengths = np.clip(ends - starts, a_min=0, a_max=None)
-
-                meth_positions, meth_values = meth_by_chrom.get(
-                    chrom,
-                    (np.array([], dtype=np.int64), np.array([], dtype=float)),
-                )
-                left_idx = np.searchsorted(meth_positions, starts, side="left")
-                right_idx = np.searchsorted(meth_positions, ends, side="left")
-
-                for idx, (row, region_start, region_end, region_len) in enumerate(
-                    zip(chrom_df.itertuples(index=False), starts, ends, lengths)
-                ):
-                    meth_slice = meth_values[left_idx[idx] : right_idx[idx]]
-                    n_cpg = int(meth_slice.size)
-                    meth_std = (
-                        float(np.std(meth_slice, ddof=1))
-                        if meth_slice.size > 1
-                        else np.nan
-                    )
-
-                    low_mask = meth_slice < int_low_cutoff
-                    intermediate_mask = (meth_slice >= int_low_cutoff) & (
-                        meth_slice <= int_high_cutoff
-                    )
-                    high_mask = meth_slice > int_high_cutoff
-
-                    n_low_cpg = int(low_mask.sum())
-                    n_intermediate_cpg = int(intermediate_mask.sum())
-                    n_high_cpg = int(high_mask.sum())
-                    context_records.append(
-                        {
-                            "sample_id": self.sample_id,
-                            "tool": tool_name,
-                            "platform": platform,
-                            "region_type": _region_type_for_tool(tool_name),
-                            "chrom": row.chr,
-                            "start": int(region_start),
-                            "end": int(region_end),
-                            "region_length_bp": int(region_len),
-                            "n_cpg": int(meth_slice.size),
-                            "mean_meth": (
-                                float(meth_slice.mean()) if meth_slice.size else np.nan
-                            ),
-                            "median_meth": (
-                                float(np.median(meth_slice))
-                                if meth_slice.size
-                                else np.nan
-                            ),
-                            "meth_std": meth_std,
-                            "n_low_cpg": n_low_cpg,
-                            "n_intermediate_cpg": n_intermediate_cpg,
-                            "n_high_cpg": n_high_cpg,
-                            "pct_low": (n_low_cpg * 100.0 / n_cpg if n_cpg else np.nan),
-                            "pct_intermediate": (
-                                n_intermediate_cpg * 100.0 / n_cpg if n_cpg else np.nan
-                            ),
-                            "pct_high": (
-                                n_high_cpg * 100.0 / n_cpg if n_cpg else np.nan
-                            ),
-                        }
-                    )
-
-        pd.DataFrame(context_records, columns=context_columns).to_csv(
-            region_context_out, index=False
+        region_context_df = self._summarize_region_context_specs(
+            self._build_region_context_specs(platform_data),
+            platform_data,
+            int_low_cutoff=int_low_cutoff,
+            int_high_cutoff=int_high_cutoff,
+            include_region_type=True,
         )
+        region_context_df.to_csv(region_context_out, index=False)
+
+        pairwise_missing_context_df = self._summarize_region_context_specs(
+            self._build_pairwise_missing_context_specs(methyl_seg_only=True),
+            platform_data,
+            int_low_cutoff=int_low_cutoff,
+            int_high_cutoff=int_high_cutoff,
+            include_region_type=False,
+        )
+        pairwise_missing_context_df.to_csv(pairwise_missing_context_out, index=False)
         return {
             "all_run_stats": str(run_stats_out),
             "all_region_stats": str(region_stats_out),
             "all_region_context_stats": str(region_context_out),
+            "all_pairwise_missing_region_context_stats": str(
+                pairwise_missing_context_out
+            ),
         }
 
     def run_comparison(self):

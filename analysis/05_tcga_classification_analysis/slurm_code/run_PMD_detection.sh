@@ -9,9 +9,32 @@ MANIFEST="$RESULTS_ROOT/manifests/tcga_samples.tsv"
 SEGMENTATION_ROOT="$RESULTS_ROOT/segmentation"
 SUMMARY_DIR="$SEGMENTATION_ROOT/array_task_summaries"
 SEGMENTATION_SLURM="$SCRIPT_DIR/methylation_tcga_segmentation.slurm"
+CLEANUP_SLURM="$SCRIPT_DIR/methylation_tcga_cleanup.slurm"
 SEGMENTATION_PY="$SCRIPT_DIR/run_tcga_segmentation_array.py"
 ARRAY_TASK_COUNT=${ARRAY_TASK_COUNT:-100}
 FORCE_RECREATE_PMDS=0
+
+backup_path_for() {
+  local source_path="$1"
+  local ts="$2"
+  local parent_dir
+  local base_name
+  parent_dir=$(dirname "$source_path")
+  base_name=$(basename "$source_path")
+  printf '%s/%s_backup_%s' "$parent_dir" "$base_name" "$ts"
+}
+
+stage_backup() {
+  local source_path="$1"
+  local ts="$2"
+  local backup_path
+  if [ ! -e "$source_path" ]; then
+    return 1
+  fi
+  backup_path=$(backup_path_for "$source_path" "$ts")
+  mv "$source_path" "$backup_path"
+  STAGED_BACKUPS+=("$backup_path")
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -63,19 +86,30 @@ python "$SEGMENTATION_PY" \
   --segmentation-root "$SEGMENTATION_ROOT"
 
 ts=$(date +%Y%m%d_%H%M%S)
+cleanup_job_id=""
+STAGED_BACKUPS=()
 
 if [ "$FORCE_RECREATE_PMDS" = "1" ]; then
-  echo "Force enabled: deleting existing MethylSeg PMD outputs under $SEGMENTATION_ROOT"
-  rm -rf \
-    "$SEGMENTATION_ROOT/methylseg" \
-    "$SEGMENTATION_ROOT/comparison" \
-    "$SUMMARY_DIR"
+  echo "Force enabled: moving existing MethylSeg PMD outputs to timestamped backups under $SEGMENTATION_ROOT"
+  stage_backup "$SEGMENTATION_ROOT/methylseg" "$ts" || true
+  stage_backup "$SEGMENTATION_ROOT/comparison" "$ts" || true
+  stage_backup "$SUMMARY_DIR" "$ts" || true
 fi
 
 if [ -d "$SUMMARY_DIR" ]; then
-  mv "$SUMMARY_DIR" "${SUMMARY_DIR}_backup_$ts"
+  stage_backup "$SUMMARY_DIR" "$ts" || true
 fi
 mkdir -p "$SUMMARY_DIR"
+
+if [ "${#STAGED_BACKUPS[@]}" -gt 0 ]; then
+  cleanup_targets=$(printf '%s|' "${STAGED_BACKUPS[@]}")
+  cleanup_targets=${cleanup_targets%|}
+  cleanup_job_id=$(sbatch --parsable \
+    --chdir="$RESULTS_ROOT" \
+    --job-name=tcga_cleanup_${ts} \
+    --export=ALL,RESULTS_ROOT="${RESULTS_ROOT}",CLEANUP_TARGETS="${cleanup_targets}" \
+    "$CLEANUP_SLURM")
+fi
 
 array_job_id=$(sbatch --parsable \
   --chdir="$RESULTS_ROOT" \
@@ -88,4 +122,7 @@ echo "Segmentation root: $SEGMENTATION_ROOT"
 echo "Array task summaries: $SUMMARY_DIR"
 echo "Array tasks: $ARRAY_TASK_COUNT"
 echo "Force recreate PMDs: $FORCE_RECREATE_PMDS"
+if [ -n "$cleanup_job_id" ]; then
+  echo "Submitted cleanup job: $cleanup_job_id"
+fi
 echo "Submitted PMD detection array job: $array_job_id"

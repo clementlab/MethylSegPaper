@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pandas as pd
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
 for import_path in [str(SCRIPT_DIR), str(PROJECT_ROOT)]:
@@ -20,21 +19,27 @@ matplotlib_cache_dir = Path(tempfile.gettempdir()) / f"matplotlib-{os.getuid()}"
 matplotlib_cache_dir.mkdir(parents=True, exist_ok=True)
 os.environ["MPLCONFIGDIR"] = str(matplotlib_cache_dir)
 env_bin = str(Path(sys.executable).resolve().parent)
-path_entries = os.environ.get("PATH", "").split(os.pathsep) if os.environ.get("PATH") else []
+path_entries = (
+    os.environ.get("PATH", "").split(os.pathsep) if os.environ.get("PATH") else []
+)
 if env_bin not in path_entries:
     os.environ["PATH"] = os.pathsep.join([env_bin] + path_entries)
 
 from chromatin_analysis_utils import (
+    build_source_id,
     build_tool_region_path,
     configure_pybedtools,
-    prepare_clean_region_task,
     prepare_deeptools_regions_task,
+    prepare_region_task,
     resolve_bigwig_path,
-    run_deeptools_for_sample_task,
+    run_deeptools_for_source_task,
     sample_to_sample_id,
 )
-from repo_paths import CHROMATIN_DATA_DIR, CHROMATIN_RESULTS_DIR, REGION_CALLING_RESULTS_DIR
-
+from repo_paths import (
+    CHROMATIN_DATA_DIR,
+    CHROMATIN_RESULTS_DIR,
+    REGION_CALLING_RESULTS_DIR,
+)
 
 DEFAULT_SAMPLE_NAMES = ["ESO26.wgbs", "TE5.wgbs"]
 DEFAULT_SEGMENTATION_RESULTS_PATH = REGION_CALLING_RESULTS_DIR
@@ -50,14 +55,25 @@ TOOL_REGISTRY = [
         "platform": "wgbs",
         "region_type": "PMD",
         "deeptools_order": 0,
-        "path_parts": [
-            "methylseg",
-            "{sample}",
-            "out",
-            "wgbs",
-            "summary_files",
-            "segments_cleaned_PMD.bed",
-        ],
+        "default_region_variant": "cleaned",
+        "region_paths": {
+            "raw": [
+                "methylseg",
+                "{sample}",
+                "out",
+                "wgbs",
+                "summary_files",
+                "segments_raw_PMD.bed",
+            ],
+            "cleaned": [
+                "methylseg",
+                "{sample}",
+                "out",
+                "wgbs",
+                "summary_files",
+                "segments_cleaned_PMD.bed",
+            ],
+        },
     },
     {
         "tool": "methylseg_hm450k",
@@ -67,14 +83,25 @@ TOOL_REGISTRY = [
         "platform": "hm450k",
         "region_type": "PMD",
         "deeptools_order": 1,
-        "path_parts": [
-            "methylseg",
-            "{sample}",
-            "out",
-            "hm450k",
-            "summary_files",
-            "segments_cleaned_PMD.bed",
-        ],
+        "default_region_variant": "cleaned",
+        "region_paths": {
+            "raw": [
+                "methylseg",
+                "{sample}",
+                "out",
+                "hm450k",
+                "summary_files",
+                "segments_raw_PMD.bed",
+            ],
+            "cleaned": [
+                "methylseg",
+                "{sample}",
+                "out",
+                "hm450k",
+                "summary_files",
+                "segments_cleaned_PMD.bed",
+            ],
+        },
     },
     {
         "tool": "methylseekr",
@@ -84,7 +111,15 @@ TOOL_REGISTRY = [
         "platform": "wgbs",
         "region_type": "PMD",
         "deeptools_order": 2,
-        "path_parts": ["methylseekr", "{sample}", "out", "methylseekr_PMDs.bed"],
+        "default_region_variant": "source-default",
+        "region_paths": {
+            "source-default": [
+                "methylseekr",
+                "{sample}",
+                "out",
+                "methylseekr_PMDs.bed",
+            ],
+        },
     },
     {
         "tool": "dnmtools",
@@ -94,7 +129,10 @@ TOOL_REGISTRY = [
         "platform": "wgbs",
         "region_type": "PMD",
         "deeptools_order": 3,
-        "path_parts": ["dnmtools", "{sample}", "out", "dnmtools_PMDs.bed"],
+        "default_region_variant": "source-default",
+        "region_paths": {
+            "source-default": ["dnmtools", "{sample}", "out", "dnmtools_PMDs.bed"],
+        },
     },
     {
         "tool": "dnmtools_array",
@@ -104,7 +142,15 @@ TOOL_REGISTRY = [
         "platform": "hm450k",
         "region_type": "PMD",
         "deeptools_order": 4,
-        "path_parts": ["dnmtools", "{sample}", "out", "arraymode.dnmtools_PMDs.bed"],
+        "default_region_variant": "source-default",
+        "region_paths": {
+            "source-default": [
+                "dnmtools",
+                "{sample}",
+                "out",
+                "arraymode.dnmtools_PMDs.bed",
+            ],
+        },
     },
     {
         "tool": "dnmtools_pmr",
@@ -114,7 +160,10 @@ TOOL_REGISTRY = [
         "platform": "wgbs",
         "region_type": "PMR",
         "deeptools_order": 5,
-        "path_parts": ["dnmtools", "{sample}", "out", "pmr.dnmtools_PMDs.bed"],
+        "default_region_variant": "source-default",
+        "region_paths": {
+            "source-default": ["dnmtools", "{sample}", "out", "pmr.dnmtools_PMDs.bed"],
+        },
     },
     {
         "tool": "mmseekr",
@@ -124,7 +173,15 @@ TOOL_REGISTRY = [
         "platform": "wgbs",
         "region_type": "PMD",
         "deeptools_order": 6,
-        "path_parts": ["mmseekr", "{sample}", "out", "{sample}.multiModel.PMDs.bed"],
+        "default_region_variant": "source-default",
+        "region_paths": {
+            "source-default": [
+                "mmseekr",
+                "{sample}",
+                "out",
+                "{sample}.multiModel.PMDs.bed",
+            ],
+        },
     },
     {
         "tool": "methyl_lasso",
@@ -134,7 +191,10 @@ TOOL_REGISTRY = [
         "platform": "wgbs",
         "region_type": "PMD",
         "deeptools_order": 7,
-        "path_parts": ["methyl_lasso", "{sample}", "out", "{sample}_pmd.tsv"],
+        "default_region_variant": "source-default",
+        "region_paths": {
+            "source-default": ["methyl_lasso", "{sample}", "out", "{sample}_pmd.tsv"],
+        },
     },
 ]
 
@@ -142,12 +202,57 @@ TOOL_CONFIG_BY_NAME = {config["tool"]: config for config in TOOL_REGISTRY}
 REQUIRED_TOOLS = [config["tool"] for config in TOOL_REGISTRY]
 REQUIRED_TOOL_SET = set(REQUIRED_TOOLS)
 DEFAULT_DEEPTOOLS_TOOLS = [
-    config["tool"] for config in sorted(TOOL_REGISTRY, key=lambda config: config["deeptools_order"])
+    config["tool"]
+    for config in sorted(TOOL_REGISTRY, key=lambda config: config["deeptools_order"])
 ]
 CANONICAL_CHROMOSOMES = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
-REGION_BODY_LENGTH = 1_000_000
-FLANK_LENGTH = 500_000
-DEEPTOOLS_BIN_SIZE = 1000
+REGION_BODY_LENGTH = 500_000
+WGBS_FLANK_LENGTH = 200_000
+ARRAY_FLANK_LENGTH = 500_000
+WGBS_DEEPTOOLS_BIN_SIZE = 25_000
+ARRAY_DEEPTOOLS_BIN_SIZE = 50_000
+
+SOURCE_LAYOUT = [
+    ("methylseg", "cleaned"),
+    ("methylseekr", "source-default"),
+    ("dnmtools", "source-default"),
+    ("dnmtools_pmr", "source-default"),
+    ("mmseekr", "source-default"),
+    ("methyl_lasso", "source-default"),
+    ("methylseg_hm450k", "cleaned"),
+    ("dnmtools_array", "source-default"),
+    ("methylseg", "raw"),
+    ("methylseg_hm450k", "raw"),
+]
+
+
+def _build_required_region_specs(selected_tools=None):
+    selected_tool_set = set(selected_tools) if selected_tools is not None else None
+    required_specs = []
+    for tool, region_variant in SOURCE_LAYOUT:
+        if selected_tool_set is not None and tool not in selected_tool_set:
+            continue
+        tool_config = TOOL_CONFIG_BY_NAME[tool]
+        source_order = len(required_specs)
+        if tool_config["platform"] == "hm450k":
+            flank_length = ARRAY_FLANK_LENGTH
+            deeptools_bin_size = ARRAY_DEEPTOOLS_BIN_SIZE
+        else:
+            flank_length = WGBS_FLANK_LENGTH
+            deeptools_bin_size = WGBS_DEEPTOOLS_BIN_SIZE
+        required_specs.append(
+            {
+                "tool": tool,
+                "region_variant": region_variant,
+                "source_id": build_source_id(tool, region_variant),
+                "source_order": source_order,
+                "tool_config": tool_config,
+                "deeptools_bin_size": deeptools_bin_size,
+                "flank_length": flank_length,
+                "region_body_length": REGION_BODY_LENGTH,
+            }
+        )
+    return required_specs
 
 
 def _available_cpu_count():
@@ -179,9 +284,13 @@ def run_parallel(tasks, worker, max_workers, stage_name):
         print(f"Running {stage_name} sequentially across {len(tasks)} task(s).")
         return [worker(task) for task in tasks]
 
-    print(f"Running {stage_name} with {max_workers} workers across {len(tasks)} task(s).")
+    print(
+        f"Running {stage_name} with {max_workers} workers across {len(tasks)} task(s)."
+    )
     try:
-        with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("fork")) as executor:
+        with ProcessPoolExecutor(
+            max_workers=max_workers, mp_context=mp.get_context("fork")
+        ) as executor:
             return list(executor.map(worker, tasks))
     except Exception as exc:
         print(
@@ -191,18 +300,156 @@ def run_parallel(tasks, worker, max_workers, stage_name):
         return [worker(task) for task in tasks]
 
 
-def assert_expected_tools(dataframe, dataframe_name):
+def _assert_source_membership(dataframe, expected_specs, dataframe_name):
     if dataframe.empty:
         raise AssertionError(f"{dataframe_name} is empty.")
-
+    expected_source_ids = [spec["source_id"] for spec in expected_specs]
     for sample, sample_df in dataframe.groupby("sample", sort=True):
-        observed_tools = set(sample_df["tool"])
-        missing_tools = sorted(REQUIRED_TOOL_SET - observed_tools)
-        extra_tools = sorted(observed_tools - REQUIRED_TOOL_SET)
-        if missing_tools or extra_tools:
+        observed_source_ids = sample_df.sort_values("source_order")[
+            "source_id"
+        ].tolist()
+        if observed_source_ids != expected_source_ids:
             raise AssertionError(
-                f"Unexpected tool membership for {dataframe_name} in {sample}. "
-                f"Missing={missing_tools}; Extra={extra_tools}"
+                f"Unexpected source membership for {dataframe_name} in {sample}. "
+                f"Expected={expected_source_ids}; Observed={observed_source_ids}"
+            )
+
+
+def _assert_source_membership_by_sample(
+    dataframe, expected_source_ids_by_sample, dataframe_name
+):
+    if dataframe.empty:
+        raise AssertionError(f"{dataframe_name} is empty.")
+    expected_samples = sorted(expected_source_ids_by_sample)
+    observed_samples = sorted(dataframe["sample"].astype(str).unique().tolist())
+    if observed_samples != expected_samples:
+        raise AssertionError(
+            f"Unexpected samples for {dataframe_name}. "
+            f"Expected={expected_samples}; Observed={observed_samples}"
+        )
+    for sample, expected_source_ids in expected_source_ids_by_sample.items():
+        sample_df = dataframe.loc[dataframe["sample"].eq(sample)].copy()
+        observed_source_ids = sample_df.sort_values("source_order")[
+            "source_id"
+        ].tolist()
+        if observed_source_ids != expected_source_ids:
+            raise AssertionError(
+                f"Unexpected source membership for {dataframe_name} in {sample}. "
+                f"Expected={expected_source_ids}; Observed={observed_source_ids}"
+            )
+
+
+def _assert_source_paths(dataframe, dataframe_name):
+    for row in dataframe.itertuples():
+        source_path = str(row.source_region_path)
+        if row.region_variant == "raw" and "segments_raw_PMD.bed" not in source_path:
+            raise AssertionError(
+                f"Expected raw MethylSeg path for {dataframe_name} {row.sample} {row.source_id}, got {source_path}"
+            )
+        if row.region_variant == "cleaned" and row.tool.startswith("methylseg"):
+            if "segments_cleaned_PMD.bed" not in source_path:
+                raise AssertionError(
+                    f"Expected cleaned MethylSeg path for {dataframe_name} {row.sample} {row.source_id}, got {source_path}"
+                )
+
+
+def assert_expected_source_regions(dataframe, expected_specs):
+    _assert_source_membership(dataframe, expected_specs, "chromatin_region_manifest")
+    _assert_source_paths(dataframe, "chromatin_region_manifest")
+
+
+def assert_expected_deeptools_region_rows(dataframe, expected_specs):
+    _assert_source_membership(dataframe, expected_specs, "deeptools_region_manifest")
+    _assert_source_paths(dataframe, "deeptools_region_manifest")
+    expected_bin_sizes = {
+        spec["source_id"]: int(spec["deeptools_bin_size"]) for spec in expected_specs
+    }
+    expected_flanks = {
+        spec["source_id"]: int(spec["flank_length"]) for spec in expected_specs
+    }
+    expected_bodies = {
+        spec["source_id"]: int(spec["region_body_length"]) for spec in expected_specs
+    }
+    for row in dataframe.itertuples():
+        if int(row.min_region_length_bp) != expected_bin_sizes[row.source_id]:
+            raise AssertionError(
+                f"Unexpected deepTools bin size for deeptools_region_manifest {row.sample} {row.source_id}."
+            )
+        if int(row.flank_length) != expected_flanks[row.source_id]:
+            raise AssertionError(
+                f"Unexpected flank length for deeptools_region_manifest {row.sample} {row.source_id}."
+            )
+        if int(row.region_body_length) != expected_bodies[row.source_id]:
+            raise AssertionError(
+                f"Unexpected region body length for deeptools_region_manifest {row.sample} {row.source_id}."
+            )
+
+
+def _build_expected_output_source_ids_by_sample(deeptools_region_df):
+    eligible_df = deeptools_region_df.loc[
+        deeptools_region_df["visualized_regions"] > 0
+    ].copy()
+    if eligible_df.empty:
+        return {}
+    expected_source_ids_by_sample = {}
+    for sample, sample_df in eligible_df.groupby("sample", sort=True):
+        expected_source_ids_by_sample[str(sample)] = sample_df.sort_values(
+            "source_order"
+        )["source_id"].tolist()
+    return expected_source_ids_by_sample
+
+
+def validate_deeptools_layout(expected_specs):
+    invalid_messages = []
+    for spec in expected_specs:
+        deeptools_bin_size = int(spec["deeptools_bin_size"])
+        for field_name in ["flank_length", "region_body_length"]:
+            value = int(spec[field_name])
+            if value % deeptools_bin_size != 0:
+                invalid_messages.append(
+                    f"{spec['source_id']} has {field_name}={value}, which is not a multiple of "
+                    f"deeptools_bin_size={deeptools_bin_size}."
+                )
+    if invalid_messages:
+        raise ValueError(
+            "deepTools layout is incompatible with computeMatrix scale-regions:\n"
+            + "\n".join(invalid_messages)
+        )
+
+
+def assert_expected_output_rows(dataframe, deeptools_region_df, expected_specs):
+    expected_source_ids_by_sample = _build_expected_output_source_ids_by_sample(
+        deeptools_region_df
+    )
+    if not expected_source_ids_by_sample:
+        raise AssertionError(
+            "deeptools_outputs is empty because no sample/source pairs retained regions for deepTools."
+        )
+    _assert_source_membership_by_sample(
+        dataframe, expected_source_ids_by_sample, "deeptools_outputs"
+    )
+    _assert_source_paths(dataframe, "deeptools_outputs")
+    expected_bin_sizes = {
+        spec["source_id"]: int(spec["deeptools_bin_size"]) for spec in expected_specs
+    }
+    expected_flanks = {
+        spec["source_id"]: int(spec["flank_length"]) for spec in expected_specs
+    }
+    expected_bodies = {
+        spec["source_id"]: int(spec["region_body_length"]) for spec in expected_specs
+    }
+    for row in dataframe.itertuples():
+        if int(row.deeptools_bin_size) != expected_bin_sizes[row.source_id]:
+            raise AssertionError(
+                f"Unexpected deepTools bin size for deeptools_outputs {row.sample} {row.source_id}."
+            )
+        if int(row.flank_length) != expected_flanks[row.source_id]:
+            raise AssertionError(
+                f"Unexpected flank length for deeptools_outputs {row.sample} {row.source_id}."
+            )
+        if int(row.region_body_length) != expected_bodies[row.source_id]:
+            raise AssertionError(
+                f"Unexpected region body length for deeptools_outputs {row.sample} {row.source_id}."
             )
 
 
@@ -227,14 +474,14 @@ def _build_parser():
         type=Path,
         default=None,
         help=(
-            "Directory where cleaned BEDs, manifests, and deepTools outputs will be written. "
+            "Directory where prepared BEDs, manifests, and deepTools outputs will be written. "
             "Defaults to the repo-local chromatin results directory."
         ),
     )
     parser.add_argument(
         "--skip-deeptools",
         action="store_true",
-        help="Skip deepTools matrix and profile generation.",
+        help="Skip deepTools matrix, profile, and heatmap generation after preparing BED manifests.",
     )
     parser.add_argument(
         "--include-heatmaps",
@@ -246,27 +493,35 @@ def _build_parser():
         nargs="+",
         choices=REQUIRED_TOOLS,
         default=list(DEFAULT_DEEPTOOLS_TOOLS),
-        help="Tools to include in chromatin deepTools plots. Defaults to all tools.",
+        help="Tools to include in chromatin deepTools output. All requested variants for the selected tools are run.",
     )
     return parser
 
 
-def validate_required_inputs(segmentation_results_path, chromatin_data_dir, samples):
+def validate_required_inputs(
+    segmentation_results_path, chromatin_data_dir, samples, source_specs
+):
     missing_messages = []
     for sample in samples:
         bw_path = resolve_bigwig_path(chromatin_data_dir, sample)
         if not bw_path.exists():
             missing_messages.append(f"{sample}: missing chromatin bigWig {bw_path}")
-        for tool_config in TOOL_REGISTRY:
-            raw_region_path = build_tool_region_path(segmentation_results_path, sample, tool_config)
+        for source_spec in source_specs:
+            raw_region_path = build_tool_region_path(
+                segmentation_results_path,
+                sample,
+                source_spec["tool_config"],
+                region_variant=source_spec["region_variant"],
+            )
             if not raw_region_path.exists():
                 missing_messages.append(
-                    f"{sample}: missing {tool_config['tool']} region file {raw_region_path}"
+                    f"{sample}: missing {source_spec['tool']} {source_spec['region_variant']} region file {raw_region_path}"
                 )
 
     if missing_messages:
         raise FileNotFoundError(
-            "Chromatin analysis prerequisites are missing:\n" + "\n".join(missing_messages)
+            "Chromatin analysis prerequisites are missing:\n"
+            + "\n".join(missing_messages)
         )
 
 
@@ -280,25 +535,40 @@ def run(
 ):
     segmentation_results_path = Path(segmentation_results_path).resolve()
     chromatin_data_dir = Path(chromatin_data_dir).resolve()
-    output_dir = Path(output_dir if output_dir is not None else DEFAULT_OUTPUT_DIR).resolve()
+    output_dir = Path(
+        output_dir if output_dir is not None else DEFAULT_OUTPUT_DIR
+    ).resolve()
 
-    cleaned_region_dir = output_dir / "cleaned_regions"
+    prepared_region_dir = output_dir / "cleaned_regions"
     tables_dir = output_dir / "tables"
     deeptools_dir = output_dir / "deeptools"
-    for directory in [output_dir, cleaned_region_dir, tables_dir, deeptools_dir]:
+    for directory in [output_dir, prepared_region_dir, tables_dir, deeptools_dir]:
         directory.mkdir(parents=True, exist_ok=True)
 
-    selected_deeptools_tools = list(dict.fromkeys(deeptools_tools or DEFAULT_DEEPTOOLS_TOOLS))
+    selected_deeptools_tools = list(
+        dict.fromkeys(deeptools_tools or DEFAULT_DEEPTOOLS_TOOLS)
+    )
     if not selected_deeptools_tools:
         raise ValueError("At least one tool must be selected for deepTools output.")
-
     invalid_deeptools_tools = sorted(set(selected_deeptools_tools) - REQUIRED_TOOL_SET)
     if invalid_deeptools_tools:
-        raise ValueError("Unsupported chromatin deepTools tools: " + ", ".join(invalid_deeptools_tools))
+        raise ValueError(
+            "Unsupported chromatin deepTools tools: "
+            + ", ".join(invalid_deeptools_tools)
+        )
+
+    required_region_specs = _build_required_region_specs(
+        selected_tools=selected_deeptools_tools
+    )
+    validate_deeptools_layout(required_region_specs)
 
     available_cpus = _available_cpu_count()
-    tool_workers = min(len(DEFAULT_SAMPLE_NAMES) * len(REQUIRED_TOOLS), available_cpus)
-    sample_workers = min(len(DEFAULT_SAMPLE_NAMES), available_cpus)
+    tool_workers = min(
+        len(DEFAULT_SAMPLE_NAMES) * len(required_region_specs), available_cpus
+    )
+    source_workers = min(
+        len(DEFAULT_SAMPLE_NAMES) * len(required_region_specs), available_cpus
+    )
     run_deeptools = not skip_deeptools
 
     print("Chromatin analysis configuration:")
@@ -307,92 +577,106 @@ def run(
     print(f"  Output dir:           {output_dir}")
     print(f"  Samples:              {', '.join(DEFAULT_SAMPLE_NAMES)}")
     print(f"  Available CPUs:       {available_cpus}")
-    print(f"  Tool workers:         {tool_workers}")
-    print(f"  Sample workers:       {sample_workers}")
+    print(f"  Region workers:       {tool_workers}")
+    print(f"  Source workers:       {source_workers}")
     print(f"  Run deepTools:        {run_deeptools}")
     print(f"  Include heatmaps:     {include_heatmaps}")
+    print(f"  WGBS bin size:        {WGBS_DEEPTOOLS_BIN_SIZE}")
+    print(f"  Array bin size:       {ARRAY_DEEPTOOLS_BIN_SIZE}")
     print(f"  deepTools tools:      {', '.join(selected_deeptools_tools)}")
 
     validate_required_inputs(
         segmentation_results_path=segmentation_results_path,
         chromatin_data_dir=chromatin_data_dir,
         samples=DEFAULT_SAMPLE_NAMES,
+        source_specs=required_region_specs,
     )
 
     bedtools_bin = configure_pybedtools()
     if bedtools_bin is None:
-        print("bedtools executable was not found on PATH; pybedtools operations may fail.")
+        print(
+            "bedtools executable was not found on PATH; pybedtools operations may fail."
+        )
     else:
         print(f"Using bedtools from {bedtools_bin}")
 
-    clean_region_tasks = []
+    region_tasks = []
     for sample in DEFAULT_SAMPLE_NAMES:
-        for tool_config in TOOL_REGISTRY:
-            clean_region_tasks.append(
+        for source_spec in required_region_specs:
+            region_tasks.append(
                 {
                     "sample": sample,
-                    "tool_config": tool_config,
+                    "tool_config": source_spec["tool_config"],
+                    "region_variant": source_spec["region_variant"],
+                    "source_order": int(source_spec["source_order"]),
                     "segmentation_results_path": str(segmentation_results_path),
                     "chromatin_data_dir": str(chromatin_data_dir),
-                    "cleaned_region_dir": str(cleaned_region_dir),
+                    "prepared_region_dir": str(prepared_region_dir),
                     "canonical_chromosomes": CANONICAL_CHROMOSOMES,
                 }
             )
 
     region_rows = run_parallel(
-        clean_region_tasks,
-        prepare_clean_region_task,
+        region_tasks,
+        prepare_region_task,
         tool_workers,
-        "cleaned region preparation",
+        "chromatin region preparation",
     )
-    manifest_df = pd.DataFrame(region_rows).sort_values(["sample", "deeptools_order", "tool"]).reset_index(drop=True)
+    manifest_df = (
+        pd.DataFrame(region_rows)
+        .sort_values(["sample", "source_order"])
+        .reset_index(drop=True)
+    )
     if manifest_df.empty:
         raise RuntimeError("No region sets were prepared for chromatin analysis.")
-    assert_expected_tools(manifest_df, "chromatin_region_manifest")
+    assert_expected_source_regions(manifest_df, required_region_specs)
     if (manifest_df["n_regions"] <= 0).any():
-        raise AssertionError("Some tool/sample pairs produced zero retained regions after cleaning.")
+        raise AssertionError(
+            "Some tool/sample region variants produced zero retained regions after preparation."
+        )
 
     region_manifest_path = tables_dir / "chromatin_region_manifest.tsv"
     manifest_df.to_csv(region_manifest_path, sep="\t", index=False)
     _print_dataframe(
         "Chromatin region manifest",
         manifest_df,
-        ["sample", "tool_label", "platform", "region_type", "n_regions", "total_bp", "clean_region_path"],
+        [
+            "sample",
+            "source_id",
+            "tool_variant_label",
+            "platform",
+            "region_type",
+            "region_variant",
+            "n_regions",
+            "total_bp",
+            "prepared_region_path",
+        ],
     )
 
-    deeptools_outputs_path = tables_dir / "deeptools_outputs.tsv"
-    if not run_deeptools:
-        print("Skipping deepTools execution because --skip-deeptools was provided.")
-        print("\nChromatin analysis complete.")
-        print(f"  Region manifest:   {region_manifest_path}")
-        return
-
-    missing_deeptools = [
-        command
-        for command in ["computeMatrix", "plotProfile"] + (["plotHeatmap"] if include_heatmaps else [])
-        if shutil.which(command) is None
-    ]
-    if missing_deeptools:
-        raise RuntimeError("deepTools commands are not available on PATH: " + ", ".join(missing_deeptools))
-
-    manifest_lookup = manifest_df.set_index(["sample", "tool"])
+    manifest_lookup = manifest_df.set_index(["sample", "source_id"])
     deeptools_region_tasks = []
     for sample in DEFAULT_SAMPLE_NAMES:
-        for tool in selected_deeptools_tools:
-            row = manifest_lookup.loc[(sample, tool)]
+        for source_spec in required_region_specs:
+            row = manifest_lookup.loc[(sample, source_spec["source_id"])]
             deeptools_region_tasks.append(
                 {
                     "sample": sample,
                     "sample_id": row["sample_id"],
-                    "tool": tool,
+                    "source_order": int(source_spec["source_order"]),
+                    "tool": source_spec["tool"],
+                    "source_id": source_spec["source_id"],
                     "tool_label": row["tool_label"],
+                    "tool_variant_label": row["tool_variant_label"],
                     "tool_family": row["tool_family"],
                     "platform": row["platform"],
                     "region_type": row["region_type"],
-                    "deeptools_order": int(row["deeptools_order"]),
-                    "clean_region_path": row["clean_region_path"],
+                    "region_variant": row["region_variant"],
+                    "source_region_path": row["source_region_path"],
+                    "prepared_region_path": row["prepared_region_path"],
                     "deeptools_dir": str(deeptools_dir),
-                    "deeptools_bin_size": int(DEEPTOOLS_BIN_SIZE),
+                    "deeptools_bin_size": int(source_spec["deeptools_bin_size"]),
+                    "flank_length": int(source_spec["flank_length"]),
+                    "region_body_length": int(source_spec["region_body_length"]),
                 }
             )
 
@@ -402,54 +686,143 @@ def run(
         tool_workers,
         "deepTools region BED preparation",
     )
-    deeptools_region_df = pd.DataFrame(deeptools_region_rows).sort_values(
-        ["sample", "deeptools_order", "tool"]
-    ).reset_index(drop=True)
+    deeptools_region_df = (
+        pd.DataFrame(deeptools_region_rows)
+        .sort_values(["sample", "source_order"])
+        .reset_index(drop=True)
+    )
     deeptools_region_manifest_path = tables_dir / "deeptools_region_manifest.tsv"
     deeptools_region_df.to_csv(deeptools_region_manifest_path, sep="\t", index=False)
+    assert_expected_deeptools_region_rows(deeptools_region_df, required_region_specs)
     _print_dataframe(
         "deepTools region manifest",
         deeptools_region_df,
         [
             "sample",
-            "tool_label",
+            "source_id",
+            "tool_variant_label",
             "visualized_regions",
             "excluded_short_regions",
             "deeptools_region_path",
         ],
     )
 
-    deeptools_sample_tasks = []
-    for sample in DEFAULT_SAMPLE_NAMES:
-        bw_path = resolve_bigwig_path(chromatin_data_dir, sample)
-        sample_region_rows = deeptools_region_df.loc[deeptools_region_df["sample"].eq(sample)].to_dict("records")
-        deeptools_sample_tasks.append(
-            {
-                "sample": sample,
-                "sample_id": sample_to_sample_id(sample),
-                "bw_path": str(bw_path),
-                "region_rows": sample_region_rows,
-                "deeptools_tool_order": selected_deeptools_tools,
-                "deeptools_dir": str(deeptools_dir),
-                "deeptools_bin_size": int(DEEPTOOLS_BIN_SIZE),
-                "flank_length": int(FLANK_LENGTH),
-                "region_body_length": int(REGION_BODY_LENGTH),
-                "include_heatmaps": bool(include_heatmaps),
-            }
+    deeptools_outputs_path = tables_dir / "deeptools_outputs.tsv"
+    if not run_deeptools:
+        print("Skipping deepTools execution because --skip-deeptools was provided.")
+        print("\nChromatin analysis complete.")
+        print(f"  Region manifest:           {region_manifest_path}")
+        print(f"  deepTools region manifest: {deeptools_region_manifest_path}")
+        return
+
+    missing_deeptools = [
+        command
+        for command in ["computeMatrix", "plotProfile"]
+        + (["plotHeatmap"] if include_heatmaps else [])
+        if shutil.which(command) is None
+    ]
+    if missing_deeptools:
+        raise RuntimeError(
+            "deepTools commands are not available on PATH: "
+            + ", ".join(missing_deeptools)
         )
 
-    deeptools_rows = run_parallel(
-        deeptools_sample_tasks,
-        run_deeptools_for_sample_task,
-        sample_workers,
-        "deepTools matrix and plot generation" if include_heatmaps else "deepTools matrix and profile generation",
+    skipped_source_df = deeptools_region_df.loc[
+        deeptools_region_df["visualized_regions"] <= 0
+    ].copy()
+    if not skipped_source_df.empty:
+        _print_dataframe(
+            "Skipping deepTools for source rows with zero retained regions",
+            skipped_source_df,
+            [
+                "sample",
+                "source_id",
+                "tool_variant_label",
+                "total_regions",
+                "excluded_short_regions",
+                "min_region_length_bp",
+            ],
+        )
+
+    eligible_deeptools_region_df = deeptools_region_df.loc[
+        deeptools_region_df["visualized_regions"] > 0
+    ].copy()
+    if eligible_deeptools_region_df.empty:
+        raise RuntimeError(
+            "No sample/source pairs retained regions for deepTools after platform-specific minimum-length filtering."
+        )
+
+    deeptools_region_lookup = eligible_deeptools_region_df.set_index(
+        ["sample", "source_id"]
     )
-    deeptools_outputs_df = pd.DataFrame(deeptools_rows).sort_values("sample").reset_index(drop=True)
+    deeptools_source_tasks = []
+    for sample in DEFAULT_SAMPLE_NAMES:
+        bw_path = resolve_bigwig_path(chromatin_data_dir, sample)
+        sample_id = sample_to_sample_id(sample)
+        for source_spec in required_region_specs:
+            source_key = (sample, source_spec["source_id"])
+            if source_key not in deeptools_region_lookup.index:
+                continue
+            row = deeptools_region_lookup.loc[source_key]
+            tool_variant_label = str(row["tool_variant_label"])
+            deeptools_source_tasks.append(
+                {
+                    "sample": sample,
+                    "sample_id": sample_id,
+                    "source_order": int(source_spec["source_order"]),
+                    "tool": source_spec["tool"],
+                    "source_id": source_spec["source_id"],
+                    "tool_label": row["tool_label"],
+                    "tool_variant_label": tool_variant_label,
+                    "tool_family": row["tool_family"],
+                    "platform": row["platform"],
+                    "region_type": row["region_type"],
+                    "region_variant": row["region_variant"],
+                    "source_region_path": row["source_region_path"],
+                    "prepared_region_path": row["prepared_region_path"],
+                    "deeptools_region_path": row["deeptools_region_path"],
+                    "visualized_regions": int(row["visualized_regions"]),
+                    "bw_path": str(bw_path),
+                    "deeptools_dir": str(deeptools_dir),
+                    "deeptools_bin_size": int(source_spec["deeptools_bin_size"]),
+                    "flank_length": int(source_spec["flank_length"]),
+                    "region_body_length": int(source_spec["region_body_length"]),
+                    "include_heatmaps": bool(include_heatmaps),
+                    "profile_title": f"{sample} H3K36me2 profile - {tool_variant_label}",
+                    "heatmap_title": f"{sample} H3K36me2 heatmap - {tool_variant_label}",
+                }
+            )
+
+    deeptools_rows = run_parallel(
+        deeptools_source_tasks,
+        run_deeptools_for_source_task,
+        source_workers,
+        (
+            "deepTools source matrix and plot generation"
+            if include_heatmaps
+            else "deepTools source matrix and profile generation"
+        ),
+    )
+    deeptools_outputs_df = (
+        pd.DataFrame(deeptools_rows)
+        .sort_values(["sample", "source_order"])
+        .reset_index(drop=True)
+    )
+    assert_expected_output_rows(
+        deeptools_outputs_df, deeptools_region_df, required_region_specs
+    )
     deeptools_outputs_df.to_csv(deeptools_outputs_path, sep="\t", index=False)
     _print_dataframe(
         "deepTools outputs",
         deeptools_outputs_df,
-        ["sample", "matrix_path", "sorted_regions_path", "profile_path", "heatmap_path"],
+        [
+            "sample",
+            "source_id",
+            "matrix_path",
+            "sorted_regions_path",
+            "profile_path",
+            "heatmap_path",
+        ],
     )
 
     print("\nChromatin analysis complete.")

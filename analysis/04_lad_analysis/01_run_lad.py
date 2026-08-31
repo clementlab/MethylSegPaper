@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from pybedtools import BedTool
+from scipy import stats
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ANALYSIS_DIR = Path(__file__).resolve().parent
@@ -178,6 +179,8 @@ LAD_OVERLAP_METRICS = [
     "avg_distance_to_nearest_lad",
     "avg_distance_to_nearest_lad_boundary",
     "avg_distance_to_nearest_lad_boundary_non_overlapping",
+    "avg_lads_per_overlapping_pmd",
+    "avg_lad_per_pmd",
     "pct_regions_with_boundary_within_150kb_of_lad_boundary",
     "pct_non_overlapping_regions_within_150kb_of_lad_boundary",
     "pct_regions_sharing_lad",
@@ -192,6 +195,8 @@ LAD_METRIC_LABELS = {
     "avg_distance_to_nearest_lad": "Average distance to nearest LAD (bp)",
     "avg_distance_to_nearest_lad_boundary": "Average distance to nearest LAD boundary (bp)",
     "avg_distance_to_nearest_lad_boundary_non_overlapping": "Average distance to nearest LAD boundary for non-overlapping regions (bp)",
+    "avg_lads_per_overlapping_pmd": "Average LAD overlaps per overlapping PMD",
+    "avg_lad_per_pmd": "Average LAD overlaps per PMD",
     "pct_regions_with_boundary_within_150kb_of_lad_boundary": "Fraction of regions with a boundary within 150 kb of a LAD boundary",
     "pct_non_overlapping_regions_within_150kb_of_lad_boundary": "Fraction of non-overlapping regions with a boundary within 150 kb of a LAD boundary",
     "pct_regions_sharing_lad": "Fraction of LAD-overlapping regions sharing a LAD",
@@ -205,6 +210,8 @@ LAD_METRIC_MODES = {
     "avg_distance_to_nearest_lad": "nearest_lad_distance",
     "avg_distance_to_nearest_lad_boundary": "boundary_distance",
     "avg_distance_to_nearest_lad_boundary_non_overlapping": "boundary_distance_non_overlapping",
+    "avg_lads_per_overlapping_pmd": "lad_overlap_count",
+    "avg_lad_per_pmd": "lad_overlap_count",
     "pct_regions_with_boundary_within_150kb_of_lad_boundary": "boundary_distance",
     "pct_non_overlapping_regions_within_150kb_of_lad_boundary": "boundary_distance_non_overlapping",
     "pct_regions_sharing_lad": "shared_lad",
@@ -218,6 +225,8 @@ LAD_METRIC_HIGHER_IS_BETTER = {
     "avg_distance_to_nearest_lad": False,
     "avg_distance_to_nearest_lad_boundary": False,
     "avg_distance_to_nearest_lad_boundary_non_overlapping": False,
+    "avg_lads_per_overlapping_pmd": True,
+    "avg_lad_per_pmd": True,
     "pct_regions_with_boundary_within_150kb_of_lad_boundary": True,
     "pct_non_overlapping_regions_within_150kb_of_lad_boundary": True,
     "pct_regions_sharing_lad": True,
@@ -231,6 +240,8 @@ LAD_METRIC_THRESHOLDS_BP = {
     "avg_distance_to_nearest_lad": 0,
     "avg_distance_to_nearest_lad_boundary": 0,
     "avg_distance_to_nearest_lad_boundary_non_overlapping": 0,
+    "avg_lads_per_overlapping_pmd": 0,
+    "avg_lad_per_pmd": 0,
     "pct_regions_with_boundary_within_150kb_of_lad_boundary": 150_000,
     "pct_non_overlapping_regions_within_150kb_of_lad_boundary": 150_000,
     "pct_regions_sharing_lad": 1,
@@ -245,6 +256,8 @@ NULL_METRIC_SHORT_NAME_MAP = {
     "avg_distance_to_nearest_lad": "dist_lad",
     "avg_distance_to_nearest_lad_boundary": "dist_boundary",
     "avg_distance_to_nearest_lad_boundary_non_overlapping": "dist_boundary_nonoverlap",
+    "avg_lads_per_overlapping_pmd": "avg_lads_overlap_pmd",
+    "avg_lad_per_pmd": "avg_lads_pmd",
     "pct_regions_with_boundary_within_150kb_of_lad_boundary": "boundary_pct_150kb",
     "pct_non_overlapping_regions_within_150kb_of_lad_boundary": "boundary_pct_nonoverlap_150kb",
     "pct_regions_sharing_lad": "shared_lad_pct",
@@ -258,6 +271,8 @@ NULL_METRIC_PLOT_LABEL_MAP = {
     "avg_distance_to_nearest_lad": "Avg distance to LAD",
     "avg_distance_to_nearest_lad_boundary": "Avg distance to LAD boundary",
     "avg_distance_to_nearest_lad_boundary_non_overlapping": "Avg boundary distance, non-overlap",
+    "avg_lads_per_overlapping_pmd": "Avg LAD overlaps per overlapping PMD",
+    "avg_lad_per_pmd": "Avg LAD overlaps per PMD",
     "pct_regions_with_boundary_within_150kb_of_lad_boundary": "% boundaries within 150 kb",
     "pct_non_overlapping_regions_within_150kb_of_lad_boundary": "% non-overlap boundaries within 150 kb",
     "pct_regions_sharing_lad": "% regions sharing LAD",
@@ -751,6 +766,41 @@ def calculate_pct_of_nonoverlapping_regions_with_boundary_within_150kb_of_lad_bo
     return pct
 
 
+def calculate_avg_lads_per_overlapping_pmd(lad_overlap_counts):
+    overlapping_counts = lad_overlap_counts.loc[lad_overlap_counts > 0]
+    if overlapping_counts.empty:
+        return 0.0
+    return float(overlapping_counts.mean())
+
+
+def calculate_avg_lad_per_pmd(lad_overlap_counts):
+    if lad_overlap_counts.empty:
+        return 0.0
+    return float(lad_overlap_counts.mean())
+
+
+def summarize_null_distribution(observed_value, perm_values):
+    perm_values = pd.to_numeric(perm_values, errors="coerce").dropna()
+    if perm_values.empty:
+        return np.nan, np.nan, np.nan
+
+    null_mean = float(perm_values.mean())
+    if len(perm_values) == 1:
+        null_sd = 0.0
+        z_score = 0.0 if observed_value == null_mean else np.nan
+        return null_mean, null_sd, z_score
+
+    null_sd = float(perm_values.std(ddof=1))
+    if null_sd == 0:
+        z_score = 0.0 if observed_value == null_mean else np.nan
+        return null_mean, null_sd, z_score
+
+    z_score = float(
+        stats.zmap([observed_value], perm_values.to_numpy(dtype=float), ddof=1, nan_policy="omit")[0]
+    )
+    return null_mean, null_sd, z_score
+
+
 def get_overlap_scores(
     overlaps_df,
     regions_df,
@@ -773,6 +823,12 @@ def get_overlap_scores(
     )
 
     overlap_per_region = overlaps_df.groupby("region_id")["overlap_bp"].sum()
+    lad_overlap_counts = (
+        overlaps_df.groupby("region_id")["lad_id"]
+        .nunique()
+        .reindex(regions_df["region_id"], fill_value=0)
+        .astype(float)
+    )
 
     pct_regions_overlapping_lads_gte_150kb = (
         (overlap_per_region >= 150_000).sum() / n_regions if n_regions > 0 else 0
@@ -788,6 +844,10 @@ def get_overlap_scores(
     avg_distance_to_nearest_lad_boundary_non_overlapping = (
         calculate_avg_distance_to_nearest_lad_boundary_non_overlapping(dist_df)
     )
+    avg_lads_per_overlapping_pmd = calculate_avg_lads_per_overlapping_pmd(
+        lad_overlap_counts
+    )
+    avg_lad_per_pmd = calculate_avg_lad_per_pmd(lad_overlap_counts)
 
     pct_of_regions_with_boundary_within_150kb_of_lad_boundary = (
         calculate_pct_of_regions_with_boundary_within_150kb_of_lad_boundary(dist_df)
@@ -835,6 +895,8 @@ def get_overlap_scores(
             "avg_distance_to_nearest_lad": avg_distance_to_nearest_lad,
             "avg_distance_to_nearest_lad_boundary": avg_distance_to_nearest_lad_boundary,
             "avg_distance_to_nearest_lad_boundary_non_overlapping": avg_distance_to_nearest_lad_boundary_non_overlapping,
+            "avg_lads_per_overlapping_pmd": avg_lads_per_overlapping_pmd,
+            "avg_lad_per_pmd": avg_lad_per_pmd,
             "pct_regions_with_boundary_within_150kb_of_lad_boundary": pct_of_regions_with_boundary_within_150kb_of_lad_boundary,
             "pct_non_overlapping_regions_within_150kb_of_lad_boundary": pct_non_overlapping_regions_within_150kb_of_lad_boundary,
             "pct_regions_sharing_lad": pct_regions_sharing_lad,
@@ -893,6 +955,8 @@ def get_lad_metric_count_lookup(overlaps_df, regions_df, dist_df):
         "avg_distance_to_nearest_lad": np.nan,
         "avg_distance_to_nearest_lad_boundary": np.nan,
         "avg_distance_to_nearest_lad_boundary_non_overlapping": np.nan,
+        "avg_lads_per_overlapping_pmd": np.nan,
+        "avg_lad_per_pmd": np.nan,
         "pct_regions_with_boundary_within_150kb_of_lad_boundary": int(
             boundary_within_150kb.sum()
         ),
@@ -1504,16 +1568,10 @@ def run_lad_null_model(
                 if (not perm_subset.empty and perm_col in perm_subset.columns)
                 else pd.Series(dtype=float)
             )
-            perm_values = pd.to_numeric(perm_values, errors="coerce").dropna()
-            if len(perm_values) == 0:
-                null_mean = np.nan
-                null_sd = np.nan
-            elif len(perm_values) == 1:
-                null_mean = perm_values.mean()
-                null_sd = 0.0
-            else:
-                null_mean = perm_values.mean()
-                null_sd = perm_values.std(ddof=1)
+            null_mean, null_sd, z_score = summarize_null_distribution(
+                observed_value,
+                perm_values,
+            )
 
             if pd.isna(null_mean):
                 enrichment = np.nan
@@ -1521,13 +1579,6 @@ def run_lad_null_model(
                 enrichment = np.nan if pd.isna(observed_value) or observed_value == 0 else np.inf
             else:
                 enrichment = observed_value / null_mean
-
-            if pd.isna(null_sd):
-                z_score = np.nan
-            elif null_sd == 0:
-                z_score = 0.0 if observed_value == null_mean else np.nan
-            else:
-                z_score = (observed_value - null_mean) / null_sd
 
             summary_rows.append(
                 {

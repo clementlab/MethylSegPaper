@@ -37,9 +37,18 @@ def sample_to_sample_id(sample):
     return sample.replace(".wgbs", "")
 
 
-def build_tool_region_path(segmentation_results_path, sample, tool_config):
+def build_tool_region_path(segmentation_results_path, sample, tool_config, region_variant=None):
+    region_variant = region_variant or tool_config.get("default_region_variant", "source-default")
+    region_paths = tool_config.get("region_paths")
+    if region_paths is None:
+        raise ValueError(f"Missing region_paths for {tool_config['tool']}")
+    if region_variant not in region_paths:
+        raise ValueError(
+            f"Unsupported region variant {region_variant!r} for {tool_config['tool']}. "
+            f"Supported variants: {sorted(region_paths)}"
+        )
     path = Path(segmentation_results_path)
-    for part in tool_config["path_parts"]:
+    for part in region_paths[region_variant]:
         path = path / part.format(sample=sample)
     return path
 
@@ -153,7 +162,7 @@ def merge_intervals(interval_df):
     return ensure_interval_df(merged_df)
 
 
-def clean_interval_df(interval_df, chrom_sizes):
+def normalize_interval_df(interval_df, chrom_sizes, merge_overlaps=False):
     if interval_df.empty:
         return empty_interval_df()
 
@@ -169,7 +178,18 @@ def clean_interval_df(interval_df, chrom_sizes):
     if clean_df.empty:
         return empty_interval_df()
 
-    return merge_intervals(clean_df)
+    normalized_df = ensure_interval_df(clean_df)
+    if merge_overlaps:
+        return merge_intervals(normalized_df)
+    return normalized_df
+
+
+def clean_interval_df(interval_df, chrom_sizes):
+    return normalize_interval_df(interval_df, chrom_sizes, merge_overlaps=True)
+
+
+def normalize_raw_interval_df(interval_df, chrom_sizes):
+    return normalize_interval_df(interval_df, chrom_sizes, merge_overlaps=False)
 
 
 def write_bed(interval_df, output_path):
@@ -208,14 +228,32 @@ def get_deeptools_processor_count():
     return 1
 
 
-def prepare_clean_region_task(task):
+def build_source_id(tool, region_variant):
+    return f"{tool}__{region_variant}"
+
+
+def format_tool_variant_label(tool_label, region_variant):
+    if region_variant == "raw":
+        return f"{tool_label} Raw"
+    if region_variant == "cleaned" and tool_label.startswith("MethylSeg"):
+        return f"{tool_label} Cleaned"
+    return tool_label
+
+
+def prepare_region_task(task):
     configure_pybedtools()
     sample = task["sample"]
     tool_config = task["tool_config"]
-    raw_region_path = build_tool_region_path(task["segmentation_results_path"], sample, tool_config)
+    region_variant = task["region_variant"]
+    raw_region_path = build_tool_region_path(
+        task["segmentation_results_path"],
+        sample,
+        tool_config,
+        region_variant=region_variant,
+    )
     if not raw_region_path.exists():
         raise FileNotFoundError(
-            f"Missing region file for {sample} {tool_config['tool']}: {raw_region_path}"
+            f"Missing region file for {sample} {tool_config['tool']} {region_variant}: {raw_region_path}"
         )
 
     bw_path = resolve_bigwig_path(task["chromatin_data_dir"], sample)
@@ -226,43 +264,53 @@ def prepare_clean_region_task(task):
     if not chrom_sizes:
         raise RuntimeError(f"No eligible canonical chromosomes found in {bw_path}")
 
-    clean_region_path = Path(task["cleaned_region_dir"]) / f"{sample}.{tool_config['tool']}.bed"
+    prepared_region_path = (
+        Path(task["prepared_region_dir"]) / f"{sample}.{tool_config['tool']}.{region_variant}.bed"
+    )
     raw_region_df = load_regions(tool_config, raw_region_path)
-    clean_region_df = clean_interval_df(raw_region_df, chrom_sizes)
-    if clean_region_df.empty:
+    if region_variant in {"cleaned", "source-default"}:
+        prepared_region_df = clean_interval_df(raw_region_df, chrom_sizes)
+    elif region_variant == "raw":
+        prepared_region_df = normalize_raw_interval_df(raw_region_df, chrom_sizes)
+    else:
+        prepared_region_df = normalize_raw_interval_df(raw_region_df, chrom_sizes)
+    if prepared_region_df.empty:
         raise AssertionError(
-            f"{sample} {tool_config['tool']} produced zero retained regions after cleaning."
+            f"{sample} {tool_config['tool']} {region_variant} produced zero retained regions after preparation."
         )
-    write_bed(clean_region_df, clean_region_path)
+    write_bed(prepared_region_df, prepared_region_path)
 
     return {
         "sample": sample,
         "sample_id": sample_to_sample_id(sample),
         "tool": tool_config["tool"],
+        "source_id": build_source_id(tool_config["tool"], region_variant),
         "tool_label": tool_config["tool_label"],
+        "tool_variant_label": format_tool_variant_label(tool_config["tool_label"], region_variant),
         "tool_family": tool_config["tool_family"],
         "platform": tool_config["platform"],
         "region_type": tool_config["region_type"],
-        "deeptools_order": int(tool_config["deeptools_order"]),
-        "raw_region_path": str(raw_region_path),
-        "clean_region_path": str(clean_region_path),
+        "source_order": int(task["source_order"]),
+        "region_variant": region_variant,
+        "source_region_path": str(raw_region_path),
+        "prepared_region_path": str(prepared_region_path),
         "bw_path": str(bw_path),
-        "n_regions": int(len(clean_region_df)),
-        "total_bp": int(clean_region_df["length"].sum()),
-        "median_region_bp": float(clean_region_df["length"].median()),
+        "n_regions": int(len(prepared_region_df)),
+        "total_bp": int(prepared_region_df["length"].sum()),
+        "median_region_bp": float(prepared_region_df["length"].median()),
     }
 
 
 def prepare_deeptools_regions_task(task):
     sample = task["sample"]
-    tool = task["tool"]
-    clean_region_path = Path(task["clean_region_path"])
-    sample_output_dir = Path(task["deeptools_dir"]) / sample
+    source_id = task["source_id"]
+    prepared_region_path = Path(task["prepared_region_path"])
+    sample_output_dir = Path(task["deeptools_dir"]) / sample / source_id
     sample_output_dir.mkdir(parents=True, exist_ok=True)
 
-    region_df = read_bed_interval_df(clean_region_path)
+    region_df = read_bed_interval_df(prepared_region_path)
     filtered_region_df = filter_regions_for_deeptools(region_df, task["deeptools_bin_size"])
-    filtered_path = sample_output_dir / f"{sample}.{tool}.deeptools_regions.bed"
+    filtered_path = sample_output_dir / f"{sample}.{source_id}.deeptools_regions.bed"
     write_bed(filtered_region_df, filtered_path)
 
     total_regions = int(len(region_df))
@@ -270,60 +318,52 @@ def prepare_deeptools_regions_task(task):
     return {
         "sample": sample,
         "sample_id": task["sample_id"],
-        "tool": tool,
+        "source_order": int(task["source_order"]),
+        "tool": task["tool"],
+        "source_id": source_id,
         "tool_label": task["tool_label"],
+        "tool_variant_label": task["tool_variant_label"],
         "tool_family": task["tool_family"],
         "platform": task["platform"],
         "region_type": task["region_type"],
-        "deeptools_order": int(task["deeptools_order"]),
-        "clean_region_path": str(clean_region_path),
+        "region_variant": task["region_variant"],
+        "source_region_path": task["source_region_path"],
+        "prepared_region_path": str(prepared_region_path),
         "deeptools_region_path": str(filtered_path),
         "total_regions": total_regions,
         "visualized_regions": visualized_regions,
         "excluded_short_regions": total_regions - visualized_regions,
         "min_region_length_bp": int(task["deeptools_bin_size"]),
+        "flank_length": int(task["flank_length"]),
+        "region_body_length": int(task["region_body_length"]),
     }
 
 
-def run_deeptools_for_sample_task(task):
+def run_deeptools_for_source_task(task):
     sample = task["sample"]
-    sample_output_dir = Path(task["deeptools_dir"]) / sample
+    source_id = task["source_id"]
+    sample_output_dir = Path(task["deeptools_dir"]) / sample / source_id
     sample_output_dir.mkdir(parents=True, exist_ok=True)
     deeptools_processors = get_deeptools_processor_count()
 
-    region_rows_by_tool = {row["tool"]: row for row in task["region_rows"]}
-    region_paths = []
-    region_labels = []
-    for tool in task["deeptools_tool_order"]:
-        row = region_rows_by_tool.get(tool)
-        if row is None:
-            raise AssertionError(f"Missing deepTools region manifest row for {sample} {tool}")
-        if int(row["visualized_regions"]) == 0:
-            print(
-                f"Skipping {sample} {tool} for deepTools because no regions were at least "
-                f"{task['deeptools_bin_size']} bp."
-            )
-            continue
-        region_path = Path(row["deeptools_region_path"])
-        if not region_path.exists():
-            raise FileNotFoundError(
-                f"Missing deepTools region BED for {sample} {tool}: {region_path}"
-            )
-        region_paths.append(str(region_path))
-        region_labels.append(row["tool_label"])
-
-    if not region_paths:
+    if int(task["visualized_regions"]) == 0:
         raise RuntimeError(
-            f"No regions remained for deepTools in {sample} after filtering out regions shorter "
-            f"than {task['deeptools_bin_size']} bp."
+            f"{sample} {source_id} had zero regions at least {task['deeptools_bin_size']} bp "
+            "after deepTools filtering."
         )
 
-    matrix_path = sample_output_dir / f"{sample}.h3k36me2.matrix.gz"
-    matrix_values_path = sample_output_dir / f"{sample}.h3k36me2.matrix.tsv"
-    sorted_regions_path = sample_output_dir / f"{sample}.h3k36me2.sorted_regions.bed"
-    profile_path = sample_output_dir / f"{sample}.h3k36me2.profile.png"
+    region_path = Path(task["deeptools_region_path"])
+    if not region_path.exists():
+        raise FileNotFoundError(
+            f"Missing deepTools region BED for {sample} {source_id}: {region_path}"
+        )
+
+    matrix_path = sample_output_dir / f"{sample}.{source_id}.h3k36me2.matrix.gz"
+    matrix_values_path = sample_output_dir / f"{sample}.{source_id}.h3k36me2.matrix.tsv"
+    sorted_regions_path = sample_output_dir / f"{sample}.{source_id}.h3k36me2.sorted_regions.bed"
+    profile_path = sample_output_dir / f"{sample}.{source_id}.h3k36me2.profile.png"
     include_heatmaps = bool(task.get("include_heatmaps", False))
-    heatmap_path = sample_output_dir / f"{sample}.h3k36me2.heatmap.png"
+    heatmap_path = sample_output_dir / f"{sample}.{source_id}.h3k36me2.heatmap.png"
 
     compute_matrix_command = [
         "computeMatrix",
@@ -333,7 +373,7 @@ def run_deeptools_for_sample_task(task):
         "-S",
         task["bw_path"],
         "-R",
-        *region_paths,
+        str(region_path),
         "-b",
         str(task["flank_length"]),
         "-a",
@@ -360,20 +400,20 @@ def run_deeptools_for_sample_task(task):
     profile_command = [
         "plotProfile",
         "--numPlotsPerRow",
-        "3",
+        "1",
         "-m",
         str(matrix_path),
         "--perGroup",
         "--samplesLabel",
         task["sample_id"],
         "--regionsLabel",
-        *region_labels,
+        task["tool_variant_label"],
         "--startLabel",
         "Region start",
         "--endLabel",
         "Region end",
         "--plotTitle",
-        f"{sample} H3K36me2 profile across tool-derived regions",
+        task["profile_title"],
         "-out",
         str(profile_path),
     ]
@@ -387,13 +427,13 @@ def run_deeptools_for_sample_task(task):
             "--samplesLabel",
             task["sample_id"],
             "--regionsLabel",
-            *region_labels,
+            task["tool_variant_label"],
             "--startLabel",
             "Region start",
             "--endLabel",
             "Region end",
             "--plotTitle",
-            f"{sample} H3K36me2 heatmap across tool-derived regions",
+            task["heatmap_title"],
             "--sortRegions",
             "keep",
             "--heatmapWidth",
@@ -410,6 +450,18 @@ def run_deeptools_for_sample_task(task):
     return {
         "sample": sample,
         "sample_id": task["sample_id"],
+        "source_order": int(task["source_order"]),
+        "tool": task["tool"],
+        "source_id": source_id,
+        "tool_label": task["tool_label"],
+        "tool_variant_label": task["tool_variant_label"],
+        "tool_family": task["tool_family"],
+        "platform": task["platform"],
+        "region_type": task["region_type"],
+        "region_variant": task["region_variant"],
+        "source_region_path": task["source_region_path"],
+        "prepared_region_path": task["prepared_region_path"],
+        "deeptools_region_path": task["deeptools_region_path"],
         "bw_path": str(task["bw_path"]),
         "matrix_path": str(matrix_path),
         "matrix_values_path": str(matrix_values_path),
@@ -420,6 +472,10 @@ def run_deeptools_for_sample_task(task):
         "deeptools_bin_size": int(task["deeptools_bin_size"]),
         "flank_length": int(task["flank_length"]),
         "region_body_length": int(task["region_body_length"]),
-        "region_bed_paths": json.dumps(region_paths),
-        "region_labels": json.dumps(region_labels),
+        "profile_title": task["profile_title"],
+        "heatmap_title": task["heatmap_title"],
+        "region_bed_path": str(region_path),
+        "region_label": task["tool_variant_label"],
+        "region_bed_paths": json.dumps([str(region_path)]),
+        "region_labels": json.dumps([task["tool_variant_label"]]),
     }
