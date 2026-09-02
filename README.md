@@ -119,7 +119,9 @@ The `figures/` directory contains the publication-oriented notebooks and shared
 helpers in `figures/utils/figures_utils.py`. The numbered notebooks generally
 mirror the numbered workflow areas in `analysis/`.
 
-For workflow debugging and development, several analysis folders also contain
-test or exploratory notebooks alongside the Python entrypoints.
+`figures/04_region_calling_methylseg_comparison_deeptools.ipynb` is the cached
+deepTools companion notebook for the region-calling workflow, while several
+analysis folders still contain test or exploratory notebooks alongside the
+Python entrypoints.
 
 Fix bug in methylseg 450k where it will call a region over the centromere with almost no data
