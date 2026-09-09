@@ -18,3 +18,4 @@ analysis/05_tcga_classification_analysis/utils/__pycache__/*
 analysis/01_region_calling_analysis/slurm_code/__pycache__/*
 analysis/01_region_calling_analysis/out/
 analysis/01_region_calling_analysis/utils/__pycache__/*
+docs/*
