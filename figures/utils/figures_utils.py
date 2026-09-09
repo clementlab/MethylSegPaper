@@ -150,7 +150,7 @@ TOOL_REGISTRY = [
     },
     {
         "tool": "dnmtools",
-        "tool_label": "DNMTools",
+        "tool_label": "DNMTools WGBS",
         "parser_family": "dnmtools",
         "tool_family": "dnmtools",
         "platform": "wgbs",
@@ -1358,7 +1358,7 @@ REGION_CALLING_TOOL_LABELS = {
     "methylseg_wgbs": "MethylSeg WGBS",
     "methylseg_hm450k": "MethylSeg HM450K",
     "methylseekr": "MethylSeekR",
-    "dnmtools": "DNMTools",
+    "dnmtools": "DNMTools WGBS",
     "dnmtools_array": "DNMTools Array",
     "dnmtools_pmr": "DNMTools PMR",
     "mmseekr": "MMSeekR",
@@ -1370,7 +1370,7 @@ REGION_CALLING_POINT_COLORS = {
         "MethylSeg WGBS",
         "MethylSeg HM450K",
         "MethylSeekR",
-        "DNMTools",
+        "DNMTools WGBS",
         "DNMTools Array",
         "DNMTools PMR",
         "MMSeekR",
@@ -1720,7 +1720,7 @@ def plot_pairwise_missing(
     grid.set_axis_labels("Average methylation", "Density")
     grid.set_titles("{col_name}")
     if grid._legend is not None:
-        grid._legend.set_title("Missing-side group")
+        grid._legend.set_title("Unique group")
     title_prefix = sample_id if sample_id is not None else "All samples"
     grid.fig.suptitle(
         f"{title_prefix}: Missing-region methylation by pairwise comparison",
@@ -1852,7 +1852,7 @@ SYNTHETIC_TOOL_LABELS = {
     "methylseg": "MethylSeg WGBS",
     "methylseg_hm450k": "MethylSeg HM450K",
     "methylseekr": "MethylSeekR",
-    "dnmtools": "DNMTools",
+    "dnmtools": "DNMTools WGBS",
     "dnmtools_array": "DNMTools Array",
     "dnmtools_pmr": "DNMTools PMR",
     "mmseekr": "MMSeekR",
@@ -2852,7 +2852,7 @@ LAD_TOOL_LABELS = {
     "methylseg": "MethylSeg WGBS",
     "methylseg_hm450k": "MethylSeg HM450K",
     "methylseekr": "MethylSeekR",
-    "dnmtools": "DNMTools",
+    "dnmtools": "DNMTools WGBS",
     "dnmtools_array": "DNMTools Array",
     "dnmtools_pmr": "DNMTools PMR",
     "mmseekr": "MMSeekR",

@@ -54,7 +54,7 @@ TOOL_HIGHLIGHT_COLORS = {
     "MethylSeg HM450K Raw": COLOR_PALETTE[1],
     "MethylSeg HM450K Cleaned": COLOR_PALETTE[1],
     "MethylSeekR": GRAY,
-    "DNMTools": GRAY,
+    "DNMTools WGBS": GRAY,
     "DNMTools Array": GRAY,
     "DNMTools PMR": GRAY,
     "MMSeekR": GRAY,
@@ -68,7 +68,7 @@ TOOL_HIGHLIGHT_COLORS_BY_SLUG = {
     "methylseg_wgbs": TOOL_HIGHLIGHT_COLORS["MethylSeg WGBS"],
     "methylseg_hm450k": TOOL_HIGHLIGHT_COLORS["MethylSeg HM450K"],
     "methylseekr": TOOL_HIGHLIGHT_COLORS["MethylSeekR"],
-    "dnmtools": TOOL_HIGHLIGHT_COLORS["DNMTools"],
+    "dnmtools": TOOL_HIGHLIGHT_COLORS["DNMTools WGBS"],
     "dnmtools_array": TOOL_HIGHLIGHT_COLORS["DNMTools Array"],
     "dnmtools_pmr": TOOL_HIGHLIGHT_COLORS["DNMTools PMR"],
     "mmseekr": TOOL_HIGHLIGHT_COLORS["MMSeekR"],
@@ -81,7 +81,7 @@ TOOL_DISTINCT_COLORS = {
     "MethylSeg WGBS": COLOR_PALETTE[0],
     "MethylSeg HM450K": COLOR_PALETTE[1],
     "MethylSeekR": COLOR_PALETTE[2],
-    "DNMTools": COLOR_PALETTE[4],
+    "DNMTools WGBS": COLOR_PALETTE[4],
     "DNMTools Array": COLOR_PALETTE[5],
     "DNMTools PMR": COLOR_PALETTE[6],
     "MMSeekR": COLOR_PALETTE[3],
@@ -94,7 +94,7 @@ TOOL_DISTINCT_COLORS_BY_SLUG = {
     "methylseg_wgbs": TOOL_DISTINCT_COLORS["MethylSeg WGBS"],
     "methylseg_hm450k": TOOL_DISTINCT_COLORS["MethylSeg HM450K"],
     "methylseekr": TOOL_DISTINCT_COLORS["MethylSeekR"],
-    "dnmtools": TOOL_DISTINCT_COLORS["DNMTools"],
+    "dnmtools": TOOL_DISTINCT_COLORS["DNMTools WGBS"],
     "dnmtools_array": TOOL_DISTINCT_COLORS["DNMTools Array"],
     "dnmtools_pmr": TOOL_DISTINCT_COLORS["DNMTools PMR"],
     "mmseekr": TOOL_DISTINCT_COLORS["MMSeekR"],
@@ -116,7 +116,7 @@ LAD_TOOL_COLORS = {
 
 METHYLSEG_WGBS = TOOL_HIGHLIGHT_COLORS["MethylSeg WGBS"]
 METHYLSEG_HM450K = TOOL_HIGHLIGHT_COLORS["MethylSeg HM450K"]
-DNMTOOLS_WGBS = TOOL_HIGHLIGHT_COLORS["DNMTools"]
+DNMTOOLS_WGBS = TOOL_HIGHLIGHT_COLORS["DNMTools WGBS"]
 DNMTOOLS_ARRAY = TOOL_HIGHLIGHT_COLORS["DNMTools Array"]
 DNMTOOLS_PMR = TOOL_HIGHLIGHT_COLORS["DNMTools PMR"]
 MMSEEKR = TOOL_HIGHLIGHT_COLORS["MMSeekR"]
@@ -133,7 +133,7 @@ CHROMATIN_PROFILE_COLORS = {
     "MethylSeg HM450K Raw": METHYLSEG_HM450K,
     "MethylSeg HM450K Cleaned": METHYLSEG_HM450K,
     "MethylSeekR": METHYLSEEKR,
-    "DNMTools": DNMTOOLS_WGBS,
+    "DNMTools WGBS": DNMTOOLS_WGBS,
     "DNMTools Array": DNMTOOLS_ARRAY,
     "DNMTools PMR": DNMTOOLS_PMR,
     "MMSeekR": MMSEEKR,
