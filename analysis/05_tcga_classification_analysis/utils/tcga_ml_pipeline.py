@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import platform
+import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scipy
 import seaborn as sns
+import sklearn
 from scipy import stats
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -19,7 +23,7 @@ from sklearn.metrics import (
     matthews_corrcoef,
     roc_auc_score,
 )
-from sklearn.model_selection import RepeatedStratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from tqdm.auto import tqdm
 
 from repo_paths import REFERENCE_DATA_DIR, TCGA_CLASSIFICATION_RESULTS_DIR
@@ -33,6 +37,13 @@ GAP_PATH = REFERENCE_DATA_DIR / "gap.bed"
 METH_REF = REFERENCE_DATA_DIR / "parse450K.pl.order.lookup"
 RANDOM_SEED = 42
 MAX_SPLIT_WORKERS = 50
+RF_N_ESTIMATORS = 500
+RF_CLASS_WEIGHT = 'balanced'
+IMPUTATION_STRATEGY = 'mean'
+TCGA_PATIENT_ID_RULE = 'first_three_hyphen_delimited_tcga_barcode_fields'
+TCGA_SAMPLE_BARCODE_PATTERN = re.compile(
+    r'^(?P<patient_id>TCGA-[A-Z0-9]{2}-[A-Z0-9]{4})(?:-[A-Z0-9]+)+$'
+)
 _RANDOM_REGION_REFERENCE_CACHE = None
 _FEATURE_CLASSIFICATION_WORKER_STATE = {}
 CANNONICAL_CHROMOSOMES = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
@@ -86,20 +97,81 @@ def cohort_output_dir(out_root: str | Path, cohort_id: str, feature_count: int) 
     return Path(out_root) / str(cohort_id) / f'n_features_{int(feature_count)}'
 
 
+def extract_tcga_patient_id(sample_id: str) -> str:
+    """Return the participant barcode for one strict TCGA sample barcode."""
+
+    sample_id = str(sample_id)
+    match = TCGA_SAMPLE_BARCODE_PATTERN.fullmatch(sample_id)
+    if match is None:
+        raise ValueError(
+            'Expected a TCGA sample barcode of the form TCGA-XX-YYYY-ZZZ; '
+            f'got {sample_id!r}.'
+        )
+    return str(match.group('patient_id'))
+
+
+def _validated_sample_ids(samples_info: pd.DataFrame) -> pd.Series:
+    if 'sample' not in samples_info.columns:
+        raise ValueError("samples_info must contain a 'sample' column.")
+    sample_ids = samples_info['sample'].astype(str)
+    duplicate_mask = sample_ids.duplicated(keep=False)
+    if duplicate_mask.any():
+        duplicates = sorted(sample_ids.loc[duplicate_mask].unique().tolist())
+        raise ValueError(
+            'Duplicate TCGA sample barcodes are not allowed: '
+            f'{duplicates[:10]}'
+        )
+    return sample_ids
+
+
 def make_sample_types(samples_info: pd.DataFrame) -> dict[str, str]:
+    sample_ids = _validated_sample_ids(samples_info)
     return {
         str(sample): ('Normal' if str(sample_type) == 'Solid Tissue Normal' else 'Tumor')
-        for sample, sample_type in zip(samples_info['sample'], samples_info['sample_type'])
+        for sample, sample_type in zip(sample_ids, samples_info['sample_type'])
+    }
+
+
+def make_patient_groups(samples_info: pd.DataFrame) -> dict[str, str]:
+    sample_ids = _validated_sample_ids(samples_info)
+    return {
+        str(sample_id): extract_tcga_patient_id(str(sample_id))
+        for sample_id in sample_ids
     }
 
 
 def summarize_cohort_samples(samples_info: pd.DataFrame) -> dict[str, int]:
     sample_types = make_sample_types(samples_info)
+    patient_groups = make_patient_groups(samples_info)
     labels = pd.Series(sample_types, dtype='object')
+    patient_label_df = pd.DataFrame({
+        'sample_id': list(sample_types),
+        'label': [sample_types[sample_id] for sample_id in sample_types],
+        'patient_id': [patient_groups[sample_id] for sample_id in sample_types],
+    })
+    labels_per_patient = patient_label_df.groupby('patient_id')['label'].nunique()
     return {
         'n_samples': int(len(labels)),
         'n_tumor_samples': int(labels.eq('Tumor').sum()),
         'n_normal_samples': int(labels.eq('Normal').sum()),
+        'n_patients': int(patient_label_df['patient_id'].nunique()),
+        'n_tumor_patients': int(
+            patient_label_df.loc[patient_label_df['label'].eq('Tumor'), 'patient_id'].nunique()
+        ),
+        'n_normal_patients': int(
+            patient_label_df.loc[patient_label_df['label'].eq('Normal'), 'patient_id'].nunique()
+        ),
+        'n_mixed_label_patients': int(labels_per_patient.gt(1).sum()),
+    }
+
+
+def software_versions() -> dict[str, str]:
+    return {
+        'python': platform.python_version(),
+        'numpy': str(np.__version__),
+        'pandas': str(pd.__version__),
+        'scipy': str(scipy.__version__),
+        'scikit-learn': str(sklearn.__version__),
     }
 
 
@@ -111,6 +183,9 @@ def build_per_cancer_cohort_manifest(
     exclude_cohorts: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     cohort_df = samples_info.copy()
+    sample_ids = _validated_sample_ids(cohort_df)
+    cohort_df['sample'] = sample_ids
+    cohort_df['patient_id'] = sample_ids.map(extract_tcga_patient_id)
     cohort_df['cohort_id'] = cohort_df['project_id'].astype(str)
     cohort_df['binary_label'] = np.where(
         cohort_df['sample_type'].astype(str).eq('Solid Tissue Normal'),
@@ -133,9 +208,44 @@ def build_per_cancer_cohort_manifest(
     counts['n_normal_samples'] = counts['Normal'].astype(int)
     counts = counts.rename(columns={'cohort_id': 'cohort_id'})
     counts = counts[['cohort_id', 'n_samples', 'n_tumor_samples', 'n_normal_samples']].copy()
+    patient_counts = (
+        cohort_df.groupby('cohort_id', as_index=False)
+        .agg(n_patients=('patient_id', 'nunique'))
+    )
+    tumor_patient_counts = (
+        cohort_df.loc[cohort_df['binary_label'].eq('Tumor')]
+        .groupby('cohort_id')['patient_id']
+        .nunique()
+        .rename('n_tumor_patients')
+    )
+    normal_patient_counts = (
+        cohort_df.loc[cohort_df['binary_label'].eq('Normal')]
+        .groupby('cohort_id')['patient_id']
+        .nunique()
+        .rename('n_normal_patients')
+    )
+    mixed_patient_counts = (
+        cohort_df.groupby(['cohort_id', 'patient_id'])['binary_label']
+        .nunique()
+        .gt(1)
+        .groupby('cohort_id')
+        .sum()
+        .rename('n_mixed_label_patients')
+    )
+    counts = counts.merge(patient_counts, on='cohort_id', how='left')
+    counts = counts.join(tumor_patient_counts, on='cohort_id')
+    counts = counts.join(normal_patient_counts, on='cohort_id')
+    counts = counts.join(mixed_patient_counts, on='cohort_id')
+    patient_count_columns = [
+        'n_patients',
+        'n_tumor_patients',
+        'n_normal_patients',
+        'n_mixed_label_patients',
+    ]
+    counts[patient_count_columns] = counts[patient_count_columns].fillna(0).astype(int)
     counts['is_eligible'] = (
-        counts['n_tumor_samples'].ge(int(min_splits))
-        & counts['n_normal_samples'].ge(int(min_splits))
+        counts['n_tumor_patients'].ge(int(min_splits))
+        & counts['n_normal_patients'].ge(int(min_splits))
     )
 
     if include_cohorts:
@@ -265,24 +375,35 @@ def run_cohort_feature_classification(
     out_root: str | Path,
     exclude_top_normal_shared_pmds: bool = False,
     min_cpgs_for_random_regions: int = 1,
+    min_training_observed_cpgs_per_region: int = 1,
 ) -> dict[str, Path]:
-    samples_info = load_tcga_samples(str(cohort_id)).reset_index(drop=True)
+    samples_info = (
+        load_tcga_samples(str(cohort_id))
+        .sort_values('sample')
+        .reset_index(drop=True)
+    )
     if samples_info.empty:
         raise ValueError(f'No TCGA samples were found for cohort {cohort_id}.')
 
     sample_summary = summarize_cohort_samples(samples_info)
-    if sample_summary['n_tumor_samples'] < int(n_splits) or sample_summary['n_normal_samples'] < int(n_splits):
+    if (
+        sample_summary['n_tumor_patients'] < int(n_splits)
+        or sample_summary['n_normal_patients'] < int(n_splits)
+    ):
         raise ValueError(
-            f'Cohort {cohort_id} does not have enough tumor and normal samples for n_splits={int(n_splits)}.'
+            f'Cohort {cohort_id} does not have enough tumor- and normal-associated '
+            f'patients for n_splits={int(n_splits)}.'
         )
 
     meth_data = load_methylation_data(samples_info)
     sample_types = make_sample_types(samples_info)
+    sample_groups = make_patient_groups(samples_info)
     pmds_per_sample = load_pmds_per_sample(samples_info)
     cgis = load_cgis()
     results, sampled_feature_regions, fold_predictions = run_feature_classification(
         meth_data=meth_data,
         sample_types=sample_types,
+        sample_groups=sample_groups,
         pmds_per_sample=pmds_per_sample,
         cgis=cgis,
         feature_counts=[int(feature_count)],
@@ -294,6 +415,9 @@ def run_cohort_feature_classification(
         return_fold_predictions=True,
         exclude_top_normal_shared_pmds=bool(exclude_top_normal_shared_pmds),
         min_cpgs_for_random_regions=int(min_cpgs_for_random_regions),
+        min_training_observed_cpgs_per_region=int(
+            min_training_observed_cpgs_per_region
+        ),
     )
 
     for frame in (results, sampled_feature_regions, fold_predictions):
@@ -311,6 +435,66 @@ def run_cohort_feature_classification(
         'max_split_workers': int(MAX_SPLIT_WORKERS if max_split_workers is None else max_split_workers),
         'exclude_top_normal_shared_pmds': bool(exclude_top_normal_shared_pmds),
         'min_cpgs_for_random_regions': max(1, int(min_cpgs_for_random_regions)),
+        'min_training_observed_cpgs_per_region': max(
+            1,
+            int(min_training_observed_cpgs_per_region),
+        ),
+        'cv_strategy': 'repeated_stratified_group_k_fold',
+        'cv_splitter': 'sklearn.model_selection.StratifiedGroupKFold',
+        'cv_group': 'tcga_patient_id',
+        'patient_id_rule': TCGA_PATIENT_ID_RULE,
+        'repeat_seeds': [int(random_seed) + repeat for repeat in range(int(n_repeats))],
+        'classifier': {
+            'class': 'sklearn.ensemble.RandomForestClassifier',
+            'n_estimators': RF_N_ESTIMATORS,
+            'class_weight': RF_CLASS_WEIGHT,
+            'n_jobs_per_model': 1,
+        },
+        'imputation': {
+            'class': 'sklearn.impute.SimpleImputer',
+            'strategy': IMPUTATION_STRATEGY,
+            'fit_scope': 'training_partition_only',
+        },
+        'random_seed_formulas': {
+            'repeat_splitter': 'random_seed + repeat',
+            'feature_selection': (
+                'random_seed + split * 100000 + n_features * 100 + feature_draw'
+            ),
+            'feature_sampling_rng': 'random_seed + feature_selection_seed',
+            'recurrent_pmd_model': (
+                'random_seed + split * 100000 + n_features * 100'
+            ),
+            'stochastic_feature_model': 'feature_selection_seed',
+        },
+        'feature_definition': {
+            'training_data_only': True,
+            'pmd_fuzzy_merge_distance_bp': 1000,
+            'recurrent_pmd_ranking': [
+                'sample_count_descending',
+                'length_descending',
+            ],
+            'training_observed_cpg_rule': (
+                'CpG has at least one nonmissing value among training samples'
+            ),
+            'pmd_and_cgi_sampling': 'without_replacement_within_draw',
+            'pmd_and_cgi_pool_reuse': 'allowed_across_draws_and_folds',
+            'random_control_space_excludes': [
+                'centromeres',
+                'telomeres',
+                'all_tumor_PMDs_identified_in_training_fold',
+            ],
+            'random_control_anchor': 'training_observed_CpG',
+            'random_long_length_reference': 'eligible_training_tumor_PMDs',
+            'random_short_length_reference': 'eligible_CGIs',
+            'random_length_model': (
+                'gamma_fit_with_location_fixed_at_zero_and_lengths_clipped_to_'
+                'the_observed_reference_range'
+            ),
+            'random_control_nonoverlap': 'within_feature_family_and_draw',
+            'random_control_reuse': 'allowed_across_draws_and_folds',
+            'insufficient_eligible_features': 'raise_error',
+        },
+        'software_versions': software_versions(),
         'out_root': str(Path(out_root)),
         'sample_summary': sample_summary,
     }
@@ -464,6 +648,60 @@ def _build_cpg_position_lookup(cpg_anchor_df: pd.DataFrame) -> dict[str, np.ndar
     return positions_by_chrom
 
 
+def build_training_observed_cpg_position_lookup(
+    meth_data: pd.DataFrame,
+    train_sample_ids: Sequence[str],
+    *,
+    min_observed_samples: int = 1,
+) -> dict[str, np.ndarray]:
+    """Return CpG positions observed in enough samples in one training fold."""
+
+    train_sample_ids = [str(sample_id) for sample_id in train_sample_ids]
+    missing_samples = sorted(set(train_sample_ids) - set(meth_data.columns))
+    if missing_samples:
+        raise ValueError(
+            'Training samples are missing from the methylation matrix: '
+            f'{missing_samples[:10]}'
+        )
+    min_observed_samples = max(1, int(min_observed_samples))
+    observed_mask = meth_data[train_sample_ids].notna().sum(axis=1).ge(min_observed_samples)
+    observed_anchors = build_measured_cpg_anchor_table(meth_data.loc[observed_mask])
+    positions = _build_cpg_position_lookup(observed_anchors)
+    if not positions:
+        raise ValueError('No observed CpGs remained in the training fold.')
+    return positions
+
+
+def filter_regions_by_training_cpg_coverage(
+    region_df: pd.DataFrame,
+    cpg_positions_by_chrom: dict[str, np.ndarray],
+    *,
+    min_cpgs: int = 1,
+) -> pd.DataFrame:
+    """Retain regions containing enough training-observed CpG coordinates."""
+
+    if region_df is None or region_df.empty:
+        columns = [] if region_df is None else list(region_df.columns)
+        if 'training_observed_cpgs' not in columns:
+            columns.append('training_observed_cpgs')
+        return pd.DataFrame(columns=columns)
+
+    regions = region_df.copy().reset_index(drop=True)
+    normalized = _normalize_regions(regions)
+    if len(normalized) != len(regions):
+        raise ValueError('Candidate regions contain invalid coordinates.')
+    for column in ['chrom', 'start', 'end', 'length']:
+        regions[column] = normalized[column].to_numpy()
+    regions['training_observed_cpgs'] = _count_cpg_positions_per_interval(
+        normalized,
+        cpg_positions_by_chrom,
+    )
+    min_cpgs = max(1, int(min_cpgs))
+    return regions.loc[
+        regions['training_observed_cpgs'].ge(min_cpgs)
+    ].reset_index(drop=True)
+
+
 def _count_cpg_positions_in_region(
     chrom: str,
     start: int,
@@ -570,11 +808,18 @@ def _place_anchor_random_region(
         chosen_start = min_start if max_start == min_start else int(
             rng.randint(min_start, max_start + 1)
         )
+        chosen_end = chosen_start + requested_length
         return {
             'chrom': str(chosen_interval['chrom']),
             'start': chosen_start,
-            'end': chosen_start + requested_length,
+            'end': chosen_end,
             'length': requested_length,
+            'training_observed_cpgs': _count_cpg_positions_in_region(
+                str(chosen_interval['chrom']),
+                chosen_start,
+                chosen_end,
+                cpg_positions_by_chrom,
+            ),
         }
 
     candidate_starts = []
@@ -611,6 +856,7 @@ def _place_anchor_random_region(
                 'start': start,
                 'end': end,
                 'length': requested_length,
+                'training_observed_cpgs': cpg_count,
             }
 
     return None
@@ -1063,7 +1309,9 @@ def pick_random_methylation_regions(
 
     n_regions = int(n_regions)
     if n_regions <= 0:
-        return pd.DataFrame(columns=['chrom', 'start', 'end', 'length'])
+        return pd.DataFrame(
+            columns=['chrom', 'start', 'end', 'length', 'training_observed_cpgs']
+        )
 
     reference = _normalize_regions(reference_regions)
     if reference.empty:
@@ -1226,15 +1474,24 @@ def pick_random_methylation_regions(
             f'Remaining failures: {failure_df.to_dict(orient="records")}'
         )
 
-    random_regions = pd.DataFrame(random_rows, columns=['chrom', 'start', 'end', 'length'])
+    random_regions = pd.DataFrame(
+        random_rows,
+        columns=['chrom', 'start', 'end', 'length', 'training_observed_cpgs'],
+    )
     return random_regions.sort_values(['chrom', 'start', 'end']).reset_index(drop=True)
 
-def _sample_region_rows(region_df, n_regions, seed):
+def _sample_region_rows(region_df, n_regions, seed, *, feature_set_name='regions'):
     regions = region_df.copy()
-    if regions.empty:
-        return regions
-    replace = len(regions) < int(n_regions)
-    sampled = regions.sample(n=int(n_regions), replace=replace, random_state=seed).reset_index(drop=True)
+    coordinate_columns = ['chrom', 'start', 'end']
+    if set(coordinate_columns).issubset(regions.columns):
+        regions = regions.drop_duplicates(subset=coordinate_columns).reset_index(drop=True)
+    n_regions = int(n_regions)
+    if len(regions) < n_regions:
+        raise ValueError(
+            f'{feature_set_name} has {len(regions)} distinct eligible regions, '
+            f'but {n_regions} were requested.'
+        )
+    sampled = regions.sample(n=n_regions, replace=False, random_state=seed).reset_index(drop=True)
     if {'start', 'end'}.issubset(sampled.columns) and 'length' not in sampled.columns:
         sampled['length'] = sampled['end'] - sampled['start']
     return sampled
@@ -1247,6 +1504,7 @@ def pick_features(
     random_seed=42,
     cpg_positions_by_chrom: dict[str, np.ndarray] | None = None,
     min_cpgs_for_random_regions: int = 1,
+    control_excluded_regions: pd.DataFrame | None = None,
 ):
     """
     Build the five region sets used in the classification benchmark.
@@ -1282,38 +1540,51 @@ def pick_features(
         training_pmds,
         n_features,
         seed=int(rng.randint(0, 2**31 - 1)),
+        feature_set_name='Random PMD',
     )
 
     random_cgis = _sample_region_rows(
         cgis,
         n_features,
         seed=int(rng.randint(0, 2**31 - 1)),
+        feature_set_name='CGI',
     )
 
     pmd_length_distribution = fit_gamma_length_distribution(training_pmds)
     cgi_length_distribution = fit_gamma_length_distribution(cgis)
 
-    random_long_regions = pick_random_methylation_regions(
-        n_regions=n_features,
-        reference_regions=training_pmds,
-        length_distribution=pmd_length_distribution,
-        random_seed=int(rng.randint(0, 2**31 - 1)),
-        excluded_regions=training_pmds,
-        cpg_positions_by_chrom=cpg_positions_by_chrom,
-        min_cpgs_for_random_regions=min_cpgs_for_random_regions,
-        sample_from_cpg_anchors=True,
+    excluded_control_regions = (
+        training_pmds
+        if control_excluded_regions is None
+        else control_excluded_regions
     )
+    try:
+        random_long_regions = pick_random_methylation_regions(
+            n_regions=n_features,
+            reference_regions=training_pmds,
+            length_distribution=pmd_length_distribution,
+            random_seed=int(rng.randint(0, 2**31 - 1)),
+            excluded_regions=excluded_control_regions,
+            cpg_positions_by_chrom=cpg_positions_by_chrom,
+            min_cpgs_for_random_regions=min_cpgs_for_random_regions,
+            sample_from_cpg_anchors=True,
+        )
+    except ValueError as exc:
+        raise ValueError(f'Random long feature sampling failed: {exc}') from exc
 
-    random_short_regions = pick_random_methylation_regions(
-        n_regions=n_features,
-        reference_regions=cgis,
-        length_distribution=cgi_length_distribution,
-        random_seed=int(rng.randint(0, 2**31 - 1)),
-        excluded_regions=training_pmds,
-        cpg_positions_by_chrom=cpg_positions_by_chrom,
-        min_cpgs_for_random_regions=min_cpgs_for_random_regions,
-        sample_from_cpg_anchors=True,
-    )
+    try:
+        random_short_regions = pick_random_methylation_regions(
+            n_regions=n_features,
+            reference_regions=cgis,
+            length_distribution=cgi_length_distribution,
+            random_seed=int(rng.randint(0, 2**31 - 1)),
+            excluded_regions=excluded_control_regions,
+            cpg_positions_by_chrom=cpg_positions_by_chrom,
+            min_cpgs_for_random_regions=min_cpgs_for_random_regions,
+            sample_from_cpg_anchors=True,
+        )
+    except ValueError as exc:
+        raise ValueError(f'Random short feature sampling failed: {exc}') from exc
 
     return {
         "PMD": recurrent_pmds,
@@ -1483,29 +1754,30 @@ def score_feature_set(
 
     Returns
     -------
-    dict | None
+    dict
         Metric dictionary containing balanced accuracy, average precision,
-        macro F1, MCC, and ROC AUC, or None when the feature matrix is unusable.
+        macro F1, MCC, and ROC AUC.
     """
 
     X_train = build_region_feature_matrix(train_sample_ids, regions, methylation_data)
     X_test = build_region_feature_matrix(test_sample_ids, regions, methylation_data)
     if X_train.empty or X_test.empty:
-        return None
+        raise ValueError('The selected feature set produced an empty feature matrix.')
 
-    valid_columns = ~X_train.isna().all(axis=0)
-    X_train = X_train.loc[:, valid_columns]
-    X_test = X_test.loc[:, valid_columns]
-    if X_train.shape[1] == 0:
-        return None
+    all_missing_columns = X_train.columns[X_train.isna().all(axis=0)].tolist()
+    if all_missing_columns:
+        raise ValueError(
+            'Selected regions contained no observed methylation values in the '
+            f'training fold: {all_missing_columns}'
+        )
 
-    imputer = SimpleImputer(strategy='mean')
+    imputer = SimpleImputer(strategy=IMPUTATION_STRATEGY)
     X_train = imputer.fit_transform(X_train)
     X_test = imputer.transform(X_test)
 
     model = RandomForestClassifier(
-        n_estimators=500,
-        class_weight='balanced',
+        n_estimators=RF_N_ESTIMATORS,
+        class_weight=RF_CLASS_WEIGHT,
         n_jobs=int(rf_n_jobs),
         random_state=random_state,
     )
@@ -1530,6 +1802,7 @@ def _append_fold_prediction_rows(
     y_test,
     predicted_class,
     predicted_probability,
+    patient_groups,
     *,
     split,
     repeat,
@@ -1545,6 +1818,7 @@ def _append_fold_prediction_rows(
         'repeat': int(repeat),
         'fold': int(fold),
         'sample_id': pd.Index(test_sample_ids, dtype='object'),
+        'patient_id': [patient_groups[str(sample_id)] for sample_id in test_sample_ids],
         'sample_label': np.where(np.asarray(y_test, dtype=int) == 1, 'Tumor', 'Normal'),
         'y_true': np.asarray(y_test, dtype=int),
         'feature_draw': int(feature_draw),
@@ -1562,6 +1836,7 @@ def _append_fold_prediction_rows(
                 'repeat',
                 'fold',
                 'sample_id',
+                'patient_id',
                 'sample_label',
                 'y_true',
                 'feature_draw',
@@ -1591,11 +1866,15 @@ def _append_feature_region_rows(
     if regions is None:
         return
 
-    normalized_regions = _normalize_regions(regions)
+    region_records = regions.copy().reset_index(drop=True)
+    normalized_regions = _normalize_regions(region_records)
     if normalized_regions.empty:
         return
+    if len(normalized_regions) != len(region_records):
+        raise ValueError('Selected feature regions contain invalid coordinates.')
 
-    region_records = normalized_regions.copy().reset_index(drop=True)
+    for column in ['chrom', 'start', 'end', 'length']:
+        region_records[column] = normalized_regions[column].to_numpy()
     region_records['split'] = int(split)
     region_records['repeat'] = int(repeat)
     region_records['fold'] = int(fold)
@@ -1613,16 +1892,137 @@ def _append_feature_region_rows(
         'n_features',
         'region_index',
     ]
-    preferred_region_columns = ['chrom', 'start', 'end', 'length', 'sample_count', 'samples', 'name']
+    preferred_region_columns = [
+        'chrom',
+        'start',
+        'end',
+        'length',
+        'training_observed_cpgs',
+        'sample_count',
+        'samples',
+        'name',
+    ]
     region_columns = [column for column in preferred_region_columns if column in region_records.columns]
 
     feature_region_rows.extend(
         region_records[metadata_columns + region_columns].to_dict(orient='records')
     )
 
+
+def build_repeated_stratified_group_splits(
+    sample_ids: Sequence[str],
+    y: Sequence[int],
+    sample_groups: dict[str, str],
+    *,
+    n_splits: int,
+    n_repeats: int,
+    random_seed: int,
+) -> list[dict]:
+    """Build deterministic repeated, patient-disjoint stratified CV splits."""
+
+    sample_ids = np.asarray([str(sample_id) for sample_id in sample_ids], dtype=object)
+    y = np.asarray(y, dtype=int)
+    if len(sample_ids) != len(y):
+        raise ValueError('sample_ids and y must have the same length.')
+    duplicate_samples = pd.Series(sample_ids).duplicated(keep=False)
+    if duplicate_samples.any():
+        duplicate_ids = sorted(pd.Series(sample_ids)[duplicate_samples].unique().tolist())
+        raise ValueError(f'Duplicate sample IDs are not allowed: {duplicate_ids[:10]}')
+    missing_groups = sorted(set(sample_ids) - set(sample_groups))
+    if missing_groups:
+        raise ValueError(
+            'Patient-group assignments are missing for samples: '
+            f'{missing_groups[:10]}'
+        )
+    raw_groups = [sample_groups[sample_id] for sample_id in sample_ids]
+    if any(pd.isna(group) or not str(group).strip() for group in raw_groups):
+        raise ValueError('Patient-group assignments cannot be missing or empty.')
+    groups = np.asarray([str(group) for group in raw_groups], dtype=object)
+    expected_groups = np.asarray(
+        [extract_tcga_patient_id(sample_id) for sample_id in sample_ids],
+        dtype=object,
+    )
+    mismatched_groups = sample_ids[groups != expected_groups].tolist()
+    if mismatched_groups:
+        raise ValueError(
+            'Patient-group assignments must equal the first three TCGA barcode '
+            f'fields; mismatches include {mismatched_groups[:10]}.'
+        )
+    if np.unique(groups).size < int(n_splits):
+        raise ValueError(
+            f'Only {np.unique(groups).size} patient groups are available for '
+            f'n_splits={int(n_splits)}.'
+        )
+
+    expected_classes = set(np.unique(y).tolist())
+    if expected_classes != {0, 1}:
+        raise ValueError(f'Expected binary classes {{0, 1}}; got {sorted(expected_classes)}.')
+
+    split_jobs = []
+    for repeat in range(int(n_repeats)):
+        repeat_seed = int(random_seed) + int(repeat)
+        cv = StratifiedGroupKFold(
+            n_splits=int(n_splits),
+            shuffle=True,
+            random_state=repeat_seed,
+        )
+        test_fold_by_sample = np.full(len(sample_ids), -1, dtype=int)
+        patient_test_folds: dict[str, set[int]] = {}
+        for fold, (train_idx, test_idx) in enumerate(cv.split(sample_ids, y, groups=groups)):
+            train_idx = np.asarray(train_idx, dtype=int)
+            test_idx = np.asarray(test_idx, dtype=int)
+            split_number = int(repeat) * int(n_splits) + int(fold)
+            train_groups = set(groups[train_idx].tolist())
+            test_groups = set(groups[test_idx].tolist())
+            overlap = sorted(train_groups & test_groups)
+            if overlap:
+                raise ValueError(
+                    f'Patient leakage in repeat={repeat}, fold={fold}: {overlap[:10]}'
+                )
+            if set(np.unique(y[train_idx]).tolist()) != expected_classes:
+                raise ValueError(
+                    f'Training partition lacks both classes in repeat={repeat}, fold={fold}.'
+                )
+            if set(np.unique(y[test_idx]).tolist()) != expected_classes:
+                raise ValueError(
+                    f'Test partition lacks both classes in repeat={repeat}, fold={fold}.'
+                )
+            if np.any(test_fold_by_sample[test_idx] != -1):
+                raise ValueError(
+                    f'Samples were assigned to multiple test folds in repeat={repeat}.'
+                )
+            test_fold_by_sample[test_idx] = int(fold)
+            for patient_id in test_groups:
+                patient_test_folds.setdefault(patient_id, set()).add(int(fold))
+            split_jobs.append({
+                'split_number': split_number,
+                'repeat': int(repeat),
+                'fold': int(fold),
+                'repeat_seed': repeat_seed,
+                'train_idx': train_idx,
+                'test_idx': test_idx,
+            })
+
+        if np.any(test_fold_by_sample < 0):
+            raise ValueError(f'Not every sample received a test fold in repeat={repeat}.')
+        split_patients = sorted(
+            patient_id
+            for patient_id, folds in patient_test_folds.items()
+            if len(folds) != 1
+        )
+        if split_patients:
+            raise ValueError(
+                f'Patients were assigned to multiple test folds in repeat={repeat}: '
+                f'{split_patients[:10]}'
+            )
+
+    return split_jobs
+
+
 def _init_feature_classification_worker(
     meth_data,
     sample_types,
+    sample_groups,
     pmds_per_sample,
     cgis,
     feature_counts,
@@ -1630,20 +2030,24 @@ def _init_feature_classification_worker(
     random_seed,
     exclude_top_normal_shared_pmds,
     min_cpgs_for_random_regions,
+    min_training_observed_cpgs_per_region,
 ):
     global _FEATURE_CLASSIFICATION_WORKER_STATE
-    cpg_anchor_df = build_measured_cpg_anchor_table(meth_data)
     _FEATURE_CLASSIFICATION_WORKER_STATE = {
         'meth_data': meth_data,
         'sample_types': sample_types,
+        'sample_groups': sample_groups,
         'pmds_per_sample': pmds_per_sample,
         'cgis': cgis,
-        'cpg_positions_by_chrom': _build_cpg_position_lookup(cpg_anchor_df),
         'feature_counts': tuple(int(value) for value in feature_counts),
         'n_feature_draws': int(n_feature_draws),
         'random_seed': int(random_seed),
         'exclude_top_normal_shared_pmds': bool(exclude_top_normal_shared_pmds),
         'min_cpgs_for_random_regions': max(1, int(min_cpgs_for_random_regions)),
+        'min_training_observed_cpgs_per_region': max(
+            1,
+            int(min_training_observed_cpgs_per_region),
+        ),
     }
 
 def _run_feature_classification_split(split_job):
@@ -1666,14 +2070,26 @@ def _run_feature_classification_split(split_job):
     y_train = y[train_idx]
     y_test = y[test_idx]
 
-    training_tumor_pmds = get_training_pmds(
+    training_observed_cpgs = build_training_observed_cpg_position_lookup(
+        state['meth_data'],
+        train_sample_ids,
+        min_observed_samples=1,
+    )
+    all_training_tumor_pmds = get_training_pmds(
         train_sample_ids,
         sample_types,
         state['pmds_per_sample'],
         label='Tumor',
     )
+    training_tumor_pmds = filter_regions_by_training_cpg_coverage(
+        all_training_tumor_pmds,
+        training_observed_cpgs,
+        min_cpgs=state['min_training_observed_cpgs_per_region'],
+    )
     if training_tumor_pmds.empty:
-        return [], [], []
+        raise ValueError(
+            f'No training-observable tumor PMDs remained for split={split_number}.'
+        )
 
     training_normal_pmds = get_training_pmds(
         train_sample_ids,
@@ -1681,7 +2097,17 @@ def _run_feature_classification_split(split_job):
         state['pmds_per_sample'],
         label='Normal',
     )
+    training_normal_pmds = filter_regions_by_training_cpg_coverage(
+        training_normal_pmds,
+        training_observed_cpgs,
+        min_cpgs=state['min_training_observed_cpgs_per_region'],
+    )
     recurrent_normal_regions = pick_recurrent_pmds(training_normal_pmds)
+    eligible_cgis = filter_regions_by_training_cpg_coverage(
+        state['cgis'],
+        training_observed_cpgs,
+        min_cpgs=state['min_training_observed_cpgs_per_region'],
+    )
 
     results = []
     feature_region_rows = []
@@ -1715,6 +2141,7 @@ def _run_feature_classification_split(split_job):
             y_test=y_test,
             predicted_class=always_cancer_predicted_class,
             predicted_probability=always_cancer_predicted_probability,
+            patient_groups=state['sample_groups'],
             split=split_number,
             repeat=repeat,
             fold=fold,
@@ -1724,71 +2151,80 @@ def _run_feature_classification_split(split_job):
         )
 
         selected_recurrent_regions = recurrent_regions.head(n_features).reset_index(drop=True)
-        if len(selected_recurrent_regions) == n_features:
-            recurrent_seed = state['random_seed'] + split_number * 100_000 + n_features * 100
-            scoring_payload = score_feature_set(
-                train_sample_ids=train_sample_ids,
-                test_sample_ids=test_sample_ids,
-                y_train=y_train,
-                y_test=y_test,
-                regions=selected_recurrent_regions,
-                methylation_data=state['meth_data'],
-                random_state=recurrent_seed,
-                rf_n_jobs=1,
-                return_predictions=True,
+        if len(selected_recurrent_regions) < n_features:
+            raise ValueError(
+                f'PMD has {len(selected_recurrent_regions)} distinct eligible regions '
+                f'for split={split_number}, but {n_features} were requested.'
             )
-            if scoring_payload is not None:
-                metrics, predicted_class, predicted_probability = scoring_payload
-                results.append({
-                    'split': split_number,
-                    'repeat': repeat,
-                    'fold': fold,
-                    'feature_draw': 0,
-                    'feature_set': 'PMD',
-                    'n_features': n_features,
-                    **metrics,
-                })
-                _append_feature_region_rows(
-                    feature_region_rows=feature_region_rows,
-                    regions=selected_recurrent_regions,
-                    split=split_number,
-                    repeat=repeat,
-                    fold=fold,
-                    feature_draw=0,
-                    feature_set='PMD',
-                    n_features=n_features,
-                )
-                _append_fold_prediction_rows(
-                    fold_prediction_rows=fold_prediction_rows,
-                    test_sample_ids=test_sample_ids,
-                    y_test=y_test,
-                    predicted_class=predicted_class,
-                    predicted_probability=predicted_probability,
-                    split=split_number,
-                    repeat=repeat,
-                    fold=fold,
-                    feature_draw=0,
-                    feature_set='PMD',
-                    n_features=n_features,
-                )
+        recurrent_seed = state['random_seed'] + split_number * 100_000 + n_features * 100
+        metrics, predicted_class, predicted_probability = score_feature_set(
+            train_sample_ids=train_sample_ids,
+            test_sample_ids=test_sample_ids,
+            y_train=y_train,
+            y_test=y_test,
+            regions=selected_recurrent_regions,
+            methylation_data=state['meth_data'],
+            random_state=recurrent_seed,
+            rf_n_jobs=1,
+            return_predictions=True,
+        )
+        results.append({
+            'split': split_number,
+            'repeat': repeat,
+            'fold': fold,
+            'feature_draw': 0,
+            'feature_set': 'PMD',
+            'n_features': n_features,
+            **metrics,
+        })
+        _append_feature_region_rows(
+            feature_region_rows=feature_region_rows,
+            regions=selected_recurrent_regions,
+            split=split_number,
+            repeat=repeat,
+            fold=fold,
+            feature_draw=0,
+            feature_set='PMD',
+            n_features=n_features,
+        )
+        _append_fold_prediction_rows(
+            fold_prediction_rows=fold_prediction_rows,
+            test_sample_ids=test_sample_ids,
+            y_test=y_test,
+            predicted_class=predicted_class,
+            predicted_probability=predicted_probability,
+            patient_groups=state['sample_groups'],
+            split=split_number,
+            repeat=repeat,
+            fold=fold,
+            feature_draw=0,
+            feature_set='PMD',
+            n_features=n_features,
+        )
 
         for draw in range(state['n_feature_draws']):
             selection_seed = state['random_seed'] + split_number * 100_000 + n_features * 100 + draw
             feature_sets = pick_features(
                 n_features=n_features,
                 training_pmds=training_tumor_pmds,
-                cgis=state['cgis'],
+                cgis=eligible_cgis,
                 offset=selection_seed,
                 random_seed=state['random_seed'],
-                cpg_positions_by_chrom=state['cpg_positions_by_chrom'],
+                cpg_positions_by_chrom=training_observed_cpgs,
                 min_cpgs_for_random_regions=state['min_cpgs_for_random_regions'],
+                control_excluded_regions=all_training_tumor_pmds,
             )
 
             for feature_set_name, regions in feature_sets.items():
-                if feature_set_name == 'PMD' or len(regions) < n_features:
+                if feature_set_name == 'PMD':
                     continue
+                if len(regions) < n_features:
+                    raise ValueError(
+                        f'{feature_set_name} returned {len(regions)} regions for '
+                        f'split={split_number}, draw={draw}; {n_features} were requested.'
+                    )
 
-                scoring_payload = score_feature_set(
+                metrics, predicted_class, predicted_probability = score_feature_set(
                     train_sample_ids=train_sample_ids,
                     test_sample_ids=test_sample_ids,
                     y_train=y_train,
@@ -1799,9 +2235,6 @@ def _run_feature_classification_split(split_job):
                     rf_n_jobs=1,
                     return_predictions=True,
                 )
-                if scoring_payload is None:
-                    continue
-                metrics, predicted_class, predicted_probability = scoring_payload
 
                 results.append({
                     'split': split_number,
@@ -1828,6 +2261,7 @@ def _run_feature_classification_split(split_job):
                     y_test=y_test,
                     predicted_class=predicted_class,
                     predicted_probability=predicted_probability,
+                    patient_groups=state['sample_groups'],
                     split=split_number,
                     repeat=repeat,
                     fold=fold,
@@ -1843,6 +2277,7 @@ def _feature_classification_process_worker(
     result_queue,
     meth_data,
     sample_types,
+    sample_groups,
     pmds_per_sample,
     cgis,
     feature_counts,
@@ -1850,6 +2285,7 @@ def _feature_classification_process_worker(
     random_seed,
     exclude_top_normal_shared_pmds,
     min_cpgs_for_random_regions,
+    min_training_observed_cpgs_per_region,
 ):
     """
     Run a chunk of CV splits inside one forked worker process.
@@ -1858,6 +2294,7 @@ def _feature_classification_process_worker(
     _init_feature_classification_worker(
         meth_data=meth_data,
         sample_types=sample_types,
+        sample_groups=sample_groups,
         pmds_per_sample=pmds_per_sample,
         cgis=cgis,
         feature_counts=feature_counts,
@@ -1865,16 +2302,29 @@ def _feature_classification_process_worker(
         random_seed=random_seed,
         exclude_top_normal_shared_pmds=exclude_top_normal_shared_pmds,
         min_cpgs_for_random_regions=min_cpgs_for_random_regions,
+        min_training_observed_cpgs_per_region=min_training_observed_cpgs_per_region,
     )
 
-    for split_job in split_jobs:
-        result_queue.put(_run_feature_classification_split(split_job))
-
-    result_queue.put(None)
+    try:
+        for split_job in split_jobs:
+            result_queue.put({
+                'kind': 'result',
+                'payload': _run_feature_classification_split(split_job),
+            })
+    except Exception as exc:
+        result_queue.put({
+            'kind': 'error',
+            'split_number': int(split_job['split_number']),
+            'error_type': type(exc).__name__,
+            'error': str(exc),
+        })
+    finally:
+        result_queue.put({'kind': 'done'})
 
 def run_feature_classification(
     meth_data,
     sample_types,
+    sample_groups,
     pmds_per_sample,
     cgis,
     feature_counts,
@@ -1886,6 +2336,7 @@ def run_feature_classification(
     return_fold_predictions=False,
     exclude_top_normal_shared_pmds=False,
     min_cpgs_for_random_regions=1,
+    min_training_observed_cpgs_per_region=1,
 ):
     """
     Benchmark region-derived feature sets with repeated stratified CV.
@@ -1897,6 +2348,9 @@ def run_feature_classification(
     sample_types : dict[str, str]
         Mapping from sample ID to class label. 'Tumor' is encoded as 1 and
         all other labels are encoded as 0.
+    sample_groups : dict[str, str]
+        Required mapping from sample ID to TCGA participant ID. All samples
+        from one participant remain in the same fold.
     pmds_per_sample : dict[str, pd.DataFrame]
         Per-sample PMD calls.
     cgis : pd.DataFrame
@@ -1923,6 +2377,9 @@ def run_feature_classification(
     min_cpgs_for_random_regions : int, default 1
         Minimum measured HM450K CpGs that must fall inside each anchored
         Random short / Random long region.
+    min_training_observed_cpgs_per_region : int, default 1
+        Minimum CpGs with at least one nonmissing training-fold value required
+        for every candidate feature region.
 
     Returns
     -------
@@ -1935,21 +2392,14 @@ def run_feature_classification(
     sample_ids = np.asarray(list(sample_types.keys()))
     y = np.asarray([1 if sample_types[sample_id] == 'Tumor' else 0 for sample_id in sample_ids])
 
-    cv = RepeatedStratifiedKFold(
+    split_jobs = build_repeated_stratified_group_splits(
+        sample_ids,
+        y,
+        sample_groups,
         n_splits=n_splits,
         n_repeats=n_repeats,
-        random_state=random_seed,
+        random_seed=random_seed,
     )
-
-    split_jobs = []
-    for split_number, (train_idx, test_idx) in enumerate(cv.split(sample_ids, y)):
-        split_jobs.append({
-            'split_number': int(split_number),
-            'repeat': int(split_number // n_splits),
-            'fold': int(split_number % n_splits),
-            'train_idx': np.asarray(train_idx, dtype=int),
-            'test_idx': np.asarray(test_idx, dtype=int),
-        })
 
     if max_split_workers is None:
         max_split_workers = MAX_SPLIT_WORKERS
@@ -1962,6 +2412,7 @@ def run_feature_classification(
         _init_feature_classification_worker(
             meth_data=meth_data,
             sample_types=sample_types,
+            sample_groups=sample_groups,
             pmds_per_sample=pmds_per_sample,
             cgis=cgis,
             feature_counts=feature_counts,
@@ -1969,6 +2420,7 @@ def run_feature_classification(
             random_seed=random_seed,
             exclude_top_normal_shared_pmds=exclude_top_normal_shared_pmds,
             min_cpgs_for_random_regions=min_cpgs_for_random_regions,
+            min_training_observed_cpgs_per_region=min_training_observed_cpgs_per_region,
         )
         split_iterator = tqdm(split_jobs, total=len(split_jobs), desc='CV splits')
         for split_job in split_iterator:
@@ -1993,6 +2445,7 @@ def run_feature_classification(
                     result_queue,
                     meth_data,
                     sample_types,
+                    sample_groups,
                     pmds_per_sample,
                     cgis,
                     feature_counts,
@@ -2000,21 +2453,26 @@ def run_feature_classification(
                     random_seed,
                     exclude_top_normal_shared_pmds,
                     min_cpgs_for_random_regions,
+                    min_training_observed_cpgs_per_region,
                 ),
             )
             process.start()
             processes.append(process)
 
         finished_workers = 0
+        worker_error = None
         progress_bar = tqdm(total=len(split_jobs), desc='CV splits')
         try:
-            while finished_workers < worker_count:
+            while finished_workers < worker_count and worker_error is None:
                 payload = result_queue.get()
-                if payload is None:
+                if payload['kind'] == 'done':
                     finished_workers += 1
                     continue
+                if payload['kind'] == 'error':
+                    worker_error = payload
+                    continue
 
-                split_results, split_feature_regions, split_fold_predictions = payload
+                split_results, split_feature_regions, split_fold_predictions = payload['payload']
                 results.extend(split_results)
                 feature_region_rows.extend(split_feature_regions)
                 fold_prediction_rows.extend(split_fold_predictions)
@@ -2022,7 +2480,15 @@ def run_feature_classification(
         finally:
             progress_bar.close()
             for process in processes:
+                if worker_error is not None and process.is_alive():
+                    process.terminate()
                 process.join()
+        if worker_error is not None:
+            raise RuntimeError(
+                'Feature-classification worker failed for '
+                f"split={worker_error['split_number']} with "
+                f"{worker_error['error_type']}: {worker_error['error']}"
+            )
 
     results_df = pd.DataFrame(results)
     feature_region_columns = [
@@ -2037,6 +2503,7 @@ def run_feature_classification(
         'start',
         'end',
         'length',
+        'training_observed_cpgs',
         'sample_count',
         'samples',
         'name',
@@ -2054,6 +2521,7 @@ def run_feature_classification(
         'repeat',
         'fold',
         'sample_id',
+        'patient_id',
         'sample_label',
         'y_true',
         'feature_draw',
@@ -2592,6 +3060,10 @@ def plot_sampled_feature_length_distributions(
 
 __all__ = [
     'MAX_SPLIT_WORKERS',
+    'RF_N_ESTIMATORS',
+    'RF_CLASS_WEIGHT',
+    'IMPUTATION_STRATEGY',
+    'TCGA_PATIENT_ID_RULE',
     'CLASSIFICATION_METRICS',
     'FEATURE_SET_ORDER',
     'FEATURE_SET_PALETTE',
@@ -2599,8 +3071,11 @@ __all__ = [
     'PMD_PATH',
     'cohort_output_dir',
     'parse_feature_counts',
+    'extract_tcga_patient_id',
     'make_sample_types',
+    'make_patient_groups',
     'summarize_cohort_samples',
+    'software_versions',
     'build_per_cancer_cohort_manifest',
     'save_feature_classification_outputs',
     'load_saved_feature_classification_task',
@@ -2609,6 +3084,8 @@ __all__ = [
     'load_tcga_samples',
     'load_methylation_data',
     'build_measured_cpg_anchor_table',
+    'build_training_observed_cpg_position_lookup',
+    'filter_regions_by_training_cpg_coverage',
     'load_pmds_per_sample',
     'collect_all_pmds',
     'load_cgis',
@@ -2616,6 +3093,7 @@ __all__ = [
     'fit_gamma_length_distribution',
     'pick_random_methylation_regions',
     'pick_features',
+    'build_repeated_stratified_group_splits',
     'run_feature_classification',
     'summarize_classification_results',
     'plot_classification_results',

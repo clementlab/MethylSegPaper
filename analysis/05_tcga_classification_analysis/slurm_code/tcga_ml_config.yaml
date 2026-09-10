@@ -6,6 +6,7 @@
   "max_split_workers": 50,
   "random_seed": 42,
   "min_cpgs_for_random_regions": 1,
+  "min_training_observed_cpgs_per_region": 1,
   "exclude_top_normal_shared_pmds": true,
   "array_task_count": 100,
   "cohort_include": [],

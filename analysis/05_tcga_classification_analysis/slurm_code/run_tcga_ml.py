@@ -14,7 +14,11 @@ for import_path in (PROJECT_ROOT, TCGA_ANALYSIS_DIR, Path(__file__).resolve().pa
 
 import pandas as pd
 
-from repo_paths import REFERENCE_DATA_DIR, TCGA_CLASSIFICATION_RESULTS_DIR  # noqa: E402
+from repo_paths import (  # noqa: E402
+    FIGURES_OUT_DIR,
+    REFERENCE_DATA_DIR,
+    TCGA_CLASSIFICATION_RESULTS_DIR,
+)
 from utils.tcga_ml_pipeline import (  # noqa: E402
     build_per_cancer_cohort_manifest,
     parse_feature_counts,
@@ -35,17 +39,23 @@ DEFAULT_CONFIG_PATH = SCRIPT_DIR / "tcga_ml_config.yaml"
 DEFAULT_FEATURE_COUNTS = (1, 3, 5, 10, 50, 100)
 DEFAULT_N_SPLITS = 5
 DEFAULT_N_REPEATS = 10
-DEFAULT_N_FEATURE_DRAWS = 5
+DEFAULT_N_FEATURE_DRAWS = 10
 DEFAULT_MAX_SPLIT_WORKERS = 50
 DEFAULT_RANDOM_SEED = 42
-DEFAULT_MIN_CPGS_FOR_RANDOM_REGIONS = 2
+DEFAULT_MIN_CPGS_FOR_RANDOM_REGIONS = 1
+DEFAULT_MIN_TRAINING_OBSERVED_CPGS_PER_REGION = 1
 DEFAULT_ARRAY_TASK_COUNT = 100
 
 SEGMENTATION_SLURM = SCRIPT_DIR / "methylation_tcga_segmentation.slurm"
 ML_SLURM = SCRIPT_DIR / "methylation_tcga_ml.slurm"
+POSTPROCESS_SLURM = SCRIPT_DIR / "methylation_tcga_postprocess.slurm"
 CLEANUP_SLURM = SCRIPT_DIR / "methylation_tcga_cleanup.slurm"
 PIPELINE_SCRIPT = SCRIPT_DIR / "run_tcga_ml_pipeline.py"
 SEGMENTATION_SCRIPT = SCRIPT_DIR / "run_tcga_segmentation_array.py"
+VALIDATION_SCRIPT = SCRIPT_DIR / "validate_tcga_ml.py"
+COMPARISON_SCRIPT = SCRIPT_DIR / "compare_tcga_ml_metrics.py"
+FIGURE_NOTEBOOK = PROJECT_ROOT / "figures" / "08_tcga_figures.ipynb"
+TCGA_FIGURE_OUT_DIR = FIGURES_OUT_DIR / "06_tcga_figures"
 SAMPLES_INFO_PATH = REFERENCE_DATA_DIR / "runAll.sh.samples"
 
 
@@ -92,6 +102,10 @@ def parse_bool(value: Any, default: bool = False) -> bool:
 
 def backup_path_for(source_path: Path, timestamp: str) -> Path:
     return source_path.parent / f"{source_path.name}_backup_{timestamp}"
+
+
+def archive_path_for(source_path: Path, timestamp: str) -> Path:
+    return source_path.parent / f"{source_path.name}_archive_{timestamp}"
 
 
 def stage_backup(
@@ -141,9 +155,16 @@ def build_sample_manifest(segmentation_root: Path) -> pd.DataFrame:
         & samples_info["methylation_file"].notna()
     ].copy()
     manifest_df["sample_id"] = manifest_df["sample"].astype(str)
-    manifest_df = manifest_df.drop_duplicates(subset=["sample_id"]).reset_index(
-        drop=True
-    )
+    duplicate_mask = manifest_df["sample_id"].duplicated(keep=False)
+    if duplicate_mask.any():
+        duplicate_ids = sorted(
+            manifest_df.loc[duplicate_mask, "sample_id"].unique().tolist()
+        )
+        raise ValueError(
+            "Duplicate TCGA sample barcodes are not allowed in the sample manifest: "
+            f"{duplicate_ids[:10]}"
+        )
+    manifest_df = manifest_df.reset_index(drop=True)
     manifest_df = manifest_df.sort_values(
         ["project_id", "sample_type", "sample_id"]
     ).reset_index(drop=True)
@@ -220,6 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--random-seed", type=int, default=None)
     parser.add_argument("--min-cpgs-for-random-regions", type=int, default=None)
     parser.add_argument(
+        "--min-training-observed-cpgs-per-region",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
         "--exclude-top-normal-shared-pmds",
         dest="exclude_top_normal_shared_pmds",
         action="store_true",
@@ -267,6 +293,14 @@ def resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
             else config.get(
                 "min_cpgs_for_random_regions",
                 DEFAULT_MIN_CPGS_FOR_RANDOM_REGIONS,
+            )
+        ),
+        "min_training_observed_cpgs_per_region": int(
+            args.min_training_observed_cpgs_per_region
+            if args.min_training_observed_cpgs_per_region is not None
+            else config.get(
+                "min_training_observed_cpgs_per_region",
+                DEFAULT_MIN_TRAINING_OBSERVED_CPGS_PER_REGION,
             )
         ),
         "exclude_top_normal_shared_pmds": parse_bool(
@@ -320,6 +354,8 @@ def main() -> None:
     ).stdout.strip()
 
     staged_backups: list[Path] = []
+    retained_archives: list[Path] = []
+    retained_figure_archives: list[Path] = []
     segmentation_job_id = ""
     cleanup_job_id = ""
 
@@ -345,7 +381,15 @@ def main() -> None:
         stage_backup(args.out_root, timestamp, staged_backups, dry_run=args.dry_run)
         segment_count = 0
     elif args.out_root.exists():
-        stage_backup(args.out_root, timestamp, staged_backups, dry_run=args.dry_run)
+        archive_path = archive_path_for(args.out_root, timestamp)
+        if not args.dry_run:
+            args.out_root.rename(archive_path)
+        retained_archives.append(archive_path)
+        if TCGA_FIGURE_OUT_DIR.exists():
+            figure_archive_path = archive_path_for(TCGA_FIGURE_OUT_DIR, timestamp)
+            if not args.dry_run:
+                TCGA_FIGURE_OUT_DIR.rename(figure_archive_path)
+            retained_figure_archives.append(figure_archive_path)
 
     if segment_count < expected_segment_count:
         summary_dir = args.segmentation_root / "array_task_summaries"
@@ -415,6 +459,8 @@ def main() -> None:
                     f"MAX_SPLIT_WORKERS={settings['max_split_workers']},"
                     f"RANDOM_SEED={settings['random_seed']},"
                     f"MIN_CPGS_FOR_RANDOM_REGIONS={settings['min_cpgs_for_random_regions']},"
+                    "MIN_TRAINING_OBSERVED_CPGS_PER_REGION="
+                    f"{settings['min_training_observed_cpgs_per_region']},"
                     f"EXCLUDE_TOP_NORMAL_SHARED_PMDS={1 if settings['exclude_top_normal_shared_pmds'] else 0}"
                 ),
                 f"--array=1-{n_cohorts}",
@@ -423,6 +469,41 @@ def main() -> None:
         )
         ml_job_ids[int(feature_count)] = submit_or_echo(
             ml_command, dry_run=args.dry_run
+        )
+
+    postprocess_job_id = ""
+    if retained_archives:
+        postprocess_command = sbatch_command(
+            "--parsable",
+            f"--chdir={RESULTS_ROOT}",
+            f"--job-name=tcga_grouped_postprocess_{timestamp}",
+        )
+        completed_ml_job_ids = [
+            job_id for job_id in ml_job_ids.values() if job_id != "dry-run"
+        ]
+        if completed_ml_job_ids:
+            postprocess_command.append(
+                f"--dependency=afterok:{':'.join(completed_ml_job_ids)}"
+            )
+        postprocess_command.extend(
+            [
+                (
+                    "--export=ALL,"
+                    f"PROJECT_ROOT={PROJECT_ROOT},"
+                    f"RESULTS_ROOT={RESULTS_ROOT},"
+                    f"COHORT_MANIFEST={cohort_manifest},"
+                    f"GROUPED_OUT_ROOT={args.out_root},"
+                    f"SAMPLE_LEVEL_ARCHIVE={retained_archives[0]},"
+                    f"VALIDATION_SCRIPT={VALIDATION_SCRIPT},"
+                    f"COMPARISON_SCRIPT={COMPARISON_SCRIPT},"
+                    f"FIGURE_NOTEBOOK={FIGURE_NOTEBOOK}"
+                ),
+                POSTPROCESS_SLURM,
+            ]
+        )
+        postprocess_job_id = submit_or_echo(
+            postprocess_command,
+            dry_run=args.dry_run,
         )
 
     launcher_record = {
@@ -439,7 +520,12 @@ def main() -> None:
         },
         "segmentation_job_id": segmentation_job_id,
         "cleanup_job_id": cleanup_job_id,
+        "retained_ml_archives": [str(path) for path in retained_archives],
+        "retained_figure_archives": [
+            str(path) for path in retained_figure_archives
+        ],
         "ml_job_ids": {str(key): value for key, value in ml_job_ids.items()},
+        "postprocess_job_id": postprocess_job_id,
         "dry_run": bool(args.dry_run),
     }
     write_json(
@@ -452,10 +538,16 @@ def main() -> None:
     print(f"Feature counts: {list(settings['feature_counts'])}")
     if cleanup_job_id:
         print(f"Cleanup job: {cleanup_job_id}")
+    for archive_path in retained_archives:
+        print(f"Retained previous ML archive: {archive_path}")
+    for archive_path in retained_figure_archives:
+        print(f"Retained previous TCGA figure archive: {archive_path}")
     if segmentation_job_id:
         print(f"Segmentation job: {segmentation_job_id}")
     for feature_count, job_id in ml_job_ids.items():
         print(f"ML array job for n={feature_count}: {job_id}")
+    if postprocess_job_id:
+        print(f"Validation/comparison/figure job: {postprocess_job_id}")
 
 
 if __name__ == "__main__":

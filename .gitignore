@@ -1,4 +1,5 @@
 test_*
+!analysis/05_tcga_classification_analysis/tests/test_tcga_ml_pipeline.py
 get_data/*
 data/*
 results

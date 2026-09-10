@@ -87,10 +87,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--n-repeats", type=int, default=10)
-    parser.add_argument("--n-feature-draws", type=int, default=5)
+    parser.add_argument("--n-feature-draws", type=int, default=10)
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--max-split-workers", type=int, default=50)
     parser.add_argument("--min-cpgs-for-random-regions", type=int, default=1)
+    parser.add_argument(
+        "--min-training-observed-cpgs-per-region",
+        type=int,
+        default=1,
+    )
     parser.add_argument(
         "--exclude-top-normal-shared-pmds",
         action="store_true",
@@ -122,6 +127,9 @@ def main() -> None:
             out_root=args.out_root,
             exclude_top_normal_shared_pmds=args.exclude_top_normal_shared_pmds,
             min_cpgs_for_random_regions=args.min_cpgs_for_random_regions,
+            min_training_observed_cpgs_per_region=(
+                args.min_training_observed_cpgs_per_region
+            ),
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -52,7 +52,16 @@ def build_tcga_manifest(segmentation_root: str | Path) -> pd.DataFrame:
         & samples_info["project_descriptor"].notna()
         & samples_info["methylation_file"].notna()
     ].copy()
-    manifest_df = manifest_df.drop_duplicates(subset=["sample_id"]).reset_index(drop=True)
+    duplicate_mask = manifest_df["sample_id"].astype(str).duplicated(keep=False)
+    if duplicate_mask.any():
+        duplicate_ids = sorted(
+            manifest_df.loc[duplicate_mask, "sample_id"].astype(str).unique().tolist()
+        )
+        raise ValueError(
+            "Duplicate TCGA sample barcodes are not allowed in the sample manifest: "
+            f"{duplicate_ids[:10]}"
+        )
+    manifest_df = manifest_df.reset_index(drop=True)
     manifest_df = manifest_df.sort_values(["project_id", "sample_type", "sample_id"]).reset_index(drop=True)
     manifest_df["methylation_file"] = manifest_df["methylation_file"].astype(str)
     manifest_df["methylseg_hm450k_bed"] = manifest_df["sample_id"].map(
@@ -174,6 +183,19 @@ def run_array_chunk(
     return pd.DataFrame(records)
 
 
+def assert_segmentation_chunk_complete(result_df: pd.DataFrame) -> None:
+    incomplete = result_df.loc[
+        result_df["status"].isin(["failed", "missing_output"])
+        | ~result_df["summary_exists"].astype(bool)
+    ]
+    if incomplete.empty:
+        return
+    failures = incomplete[["sample_id", "status", "error"]].to_dict(orient="records")
+    raise RuntimeError(
+        f"Segmentation chunk has {len(incomplete)} incomplete samples: {failures[:10]}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Segment TCGA HM450K samples in fixed-size Slurm array chunks."
@@ -259,6 +281,7 @@ def main() -> None:
     print(f"Wrote task summary: {summary_path}")
     if not result_df.empty:
         print(result_df["status"].value_counts(dropna=False).to_string())
+    assert_segmentation_chunk_complete(result_df)
 
 
 if __name__ == "__main__":
