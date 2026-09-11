@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: >-
+  If you use these analysis or visualization workflows, please cite this
+  repository.
+title: "MethylSegPaper: analysis and visualization workflows"
+type: software
+abstract: >-
+  Reproducible processing, benchmarking, analysis, and visualization workflows
+  supporting the MethylSeg manuscript, "MethylSeg: Context-Aware Methylome
+  Segmentation Enables Robust PMD Detection in Array and WGBS Data."
+authors:
+  - family-names: "Tye"
+    given-names: "Jacob"
+    orcid: "https://orcid.org/0009-0000-6883-9572"
+  - family-names: "Clement"
+    given-names: "Kendell"
+    orcid: "https://orcid.org/0000-0003-3808-0811"
+repository-code: "https://github.com/clementlab/MethylSegPaper"
+url: "https://github.com/clementlab/MethylSegPaper"
