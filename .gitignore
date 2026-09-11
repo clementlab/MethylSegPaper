@@ -6,6 +6,27 @@ __pycache__/
 Rplots.pdf
 get_data/*
 data/*
+# Track provenance plus small, exact analysis inputs and helpers. Bulk data
+# remain ignored and are restored using the per-directory manifests.
+!data/methylation_data/
+data/methylation_data/*
+!data/methylation_data/data_manifest.tsv
+!data/methylation_data/450k_data/
+data/methylation_data/450k_data/*
+!data/methylation_data/450k_data/wgbs_bigwig_to_450k_bigwig.py
+!data/chromatin_data/
+data/chromatin_data/*
+!data/chromatin_data/data_manifest.tsv
+!data/reference_data/
+data/reference_data/*
+!data/reference_data/data_manifest.tsv
+!data/reference_data/hg19ToHg38.over.chain
+!data/reference_data/liftover_bed.r
+!data/reference_data/runAll.sh.samples
+!data/tcga_samples/
+data/tcga_samples/*
+!data/tcga_samples/data_manifest.tsv
+!data/tcga_samples/analyzed_tcga_samples.tsv
 results
 figures/out/*
 figures/logs/*

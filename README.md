@@ -54,6 +54,22 @@ appropriate repository-local directory:
 - `data/reference_data/` for genome and analysis reference files;
 - `data/tcga_samples/` for TCGA inputs.
 
+The expected files, public accessions, derivations, and archive recommendations
+are documented separately for
+[`methylation_data`](data/methylation_data/data_manifest.tsv),
+[`chromatin_data`](data/chromatin_data/data_manifest.tsv),
+[`reference_data`](data/reference_data/data_manifest.tsv), and
+[`tcga_samples`](data/tcga_samples/data_manifest.tsv). Only these small
+manifests are tracked; the data files themselves remain excluded from Git.
+The manifests cover required inputs and directly relevant optional or derived
+files, rather than every historical artifact in a working data directory.
+
+Git includes selected small reference files and metadata tables needed to
+define the analyses exactly, including the TCGA source and analyzed-sample
+manifests. Downloadable genomic tracks, bulk methylation arrays, WGBS files,
+signal tracks, and large derived lookups remain external and are identified by
+accession or source URL in the manifests.
+
 Analysis outputs are written below `results/`. This can be an ordinary
 directory or a symlink to larger scratch storage:
 
