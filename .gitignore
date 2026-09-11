@@ -1,5 +1,9 @@
 test_*
 !analysis/05_tcga_classification_analysis/tests/test_tcga_ml_pipeline.py
+__pycache__/
+*.py[cod]
+.pytest_cache/
+Rplots.pdf
 get_data/*
 data/*
 results

@@ -4,6 +4,7 @@ message: >-
   repository.
 title: "MethylSegPaper: analysis and visualization workflows"
 type: software
+license: BSD-3-Clause
 abstract: >-
   Reproducible processing, benchmarking, analysis, and visualization workflows
   supporting the MethylSeg manuscript, "MethylSeg: Context-Aware Methylome

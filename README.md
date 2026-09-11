@@ -1,15 +1,34 @@
-# 20260624_methylseg
+# MethylSegPaper
 
-This repository contains the working analysis code for the MethylSeg benchmark
-project. It is organized around a few reproducible workflow directories under
-`analysis/`, with shared path constants in `repo_paths.py`, figure notebooks in
-`figures/`, and heavy result outputs written through the repo-local `results/`
-path.
+This repository contains the analysis workflows and figure notebooks used to
+benchmark [MethylSeg](https://github.com/clementlab/MethylSeg) and study its
+downstream biological applications. It is a companion analysis repository,
+not the MethylSeg Python package itself. For installation and usage of the
+software, see the [MethylSeg documentation](https://clementlab.github.io/MethylSeg/).
+
+The repository covers PMD-caller comparisons, synthetic recovery benchmarks,
+chromatin and lamina-associated domain (LAD) analyses, TCGA classification,
+and the notebooks used to assemble the resulting figures.
+
+## Repository contents
+
+| Location | Purpose |
+| --- | --- |
+| [`analysis/01_region_calling_analysis/`](analysis/01_region_calling_analysis/) | Compare MethylSeg with other PMD callers and aggregate their outputs. |
+| [`analysis/02_synthetic_analysis/`](analysis/02_synthetic_analysis/) | Generate synthetic PMDs and measure caller recovery. |
+| [`analysis/03_chromatin_analysis/`](analysis/03_chromatin_analysis/) | Analyze chromatin overlap and deepTools profiles. |
+| [`analysis/04_lad_analysis/`](analysis/04_lad_analysis/) | Analyze LAD overlap and laminB1 signal. |
+| [`analysis/05_tcga_classification_analysis/`](analysis/05_tcga_classification_analysis/) | Run TCGA segmentation and downstream classification. |
+| [`figures/`](figures/) | Executed publication-oriented notebooks and shared plotting helpers. |
+| [`repo_paths.py`](repo_paths.py) | Shared repository, data, results, and figure-output paths. |
+| [`environment.yaml`](environment.yaml) | Export of the software environment used for the analyses. |
 
 ## Environment
 
-The committed `environment.yaml` is an export of the live
-`jt_wgbs_analysis` conda environment used for this project.
+The committed [`environment.yaml`](environment.yaml) is an export of the
+`jt_wgbs_analysis` Conda environment used for this project. It includes the
+Python and command-line dependencies used by the workflows, including the
+version of MethylSeg used for these analyses.
 
 Create the environment with:
 
@@ -18,110 +37,113 @@ conda env create -f environment.yaml
 conda activate jt_wgbs_analysis
 ```
 
-If the environment already exists and you want to refresh it:
+To update an existing environment from the export:
 
 ```bash
 conda env update -n jt_wgbs_analysis -f environment.yaml --prune
 ```
 
-## Repository layout
+## Data and results
 
-- `analysis/01_region_calling_analysis/`: PMD caller comparison workflow and
-  aggregation.
-- `analysis/02_synthetic_analysis/`: synthetic PMD injection and recovery
-  benchmark pipeline.
-- `analysis/03_chromatin_analysis/`: chromatin overlap and deepTools analyses.
-- `analysis/04_lad_analysis/`: LAD overlap, laminB1 signal, and profile
-  analyses.
-- `analysis/05_tcga_classification_analysis/`: TCGA segmentation and downstream
-  machine-learning workflows.
-- `figures/`: figure notebooks and shared plotting helpers.
-- `data/`: local data staging and reference assets.
-- `get_data/`: helper code for fetching project inputs.
-- `repo_paths.py`: canonical project, data, figure, and results paths.
+Large input datasets, intermediate files, and generated figure files are not
+stored in Git. Before running a workflow, stage the required files under the
+appropriate repository-local directory:
 
-## Results and path conventions
+- `data/methylation_data/` for WGBS and array methylation inputs;
+- `data/chromatin_data/` for chromatin signal and interval tracks;
+- `data/reference_data/` for genome and analysis reference files;
+- `data/tcga_samples/` for TCGA inputs.
 
-This checkout keeps a stable repo-local `results/` path, but in practice that
-path is a symlink to scratch storage on CHPC. Scripts should use
-`repo_paths.py` or the repo-local `results/` path instead of hard-coding a
-scratch location.
-
-Most workflows are written so that:
-
-- code lives in the repo,
-- large intermediate files land under `results/`,
-- notebooks and scripts can share the same analysis output tree.
-
-Figure exports belong under `figures/out/`, not under `results/`. Figure
-notebooks should write publication assets into subdirectories of
-`figures/out/`, while analysis workflows keep writing data products into
-`results/`.
-
-## Main workflow entrypoints
-
-### 1. Region calling benchmark
-
-Submit the comparator array plus aggregation:
+Analysis outputs are written below `results/`. This can be an ordinary
+directory or a symlink to larger scratch storage:
 
 ```bash
-cd analysis/01_region_calling_analysis/slurm_code
-./run_slurm.sh
+mkdir -p results
+
+# Alternatively, from a fresh clone:
+ln -s /path/to/scratch/results results
 ```
 
-The sample/config manifest lives in `analysis/01_region_calling_analysis/slurm_code/configs.txt`.
+Figure notebooks write exported assets below `figures/out/`. The notebooks in
+[`figures/`](figures/) retain their executed outputs so that their results can
+be inspected on GitHub, but re-executing them requires the corresponding local
+data and analysis results.
 
-### 2. Synthetic recovery benchmark
+> [!IMPORTANT]
+> The tracked configurations and Slurm scripts reflect the original CHPC
+> environment and include checkout-specific paths and CHPC scheduler settings.
+> Users running elsewhere must adapt those paths, partitions, accounts, and
+> resource requests to their system. Portability changes are intentionally
+> outside the scope of this repository snapshot.
 
-Run the synthetic PMD pipeline:
+## Main workflows
+
+Run commands from the repository root after activating the environment and
+staging the required inputs.
+
+### Region-calling benchmark
+
+Submit the caller-comparison and aggregation jobs:
 
 ```bash
-cd analysis/02_synthetic_analysis/slurm_code
-./run_slurm.sh
+./analysis/01_region_calling_analysis/slurm_code/run_slurm.sh
 ```
 
-This workflow has a more detailed local guide in
-`analysis/02_synthetic_analysis/slurm_code/README.md`.
+The sample list is defined in
+[`configs.txt`](analysis/01_region_calling_analysis/slurm_code/configs.txt),
+with individual YAML configurations in the adjacent `configs/` directory.
 
-### 3. Chromatin analysis
+### Synthetic recovery benchmark
 
-Run the chromatin analysis against comparator outputs:
+Submit the synthetic PMD workflow:
+
+```bash
+./analysis/02_synthetic_analysis/slurm_code/run_slurm.sh
+```
+
+See the
+[`Synthetic Slurm Pipeline` guide](analysis/02_synthetic_analysis/slurm_code/README.md)
+for output structure, reuse rules, and targeted reruns.
+
+### Chromatin analysis
+
+Inspect the available options or submit the CHPC workflow:
 
 ```bash
 python analysis/03_chromatin_analysis/run_chromatin.py --help
+./analysis/03_chromatin_analysis/slurm_code/run_slurm.sh --help
 ```
 
-### 4. LAD analysis
+### LAD analysis
 
-Run the LAD overlap and signal workflow:
+Inspect the local runner or Slurm options:
 
 ```bash
 python analysis/04_lad_analysis/01_run_lad.py --help
+./analysis/04_lad_analysis/slurm_code/run_slurm.sh --help
 ```
 
-### 5. TCGA classification
+### TCGA classification
 
-The Slurm entrypoints and defaults are documented in:
-
-- `analysis/05_tcga_classification_analysis/slurm_code/README_TCGA_ML.md`
-
-Typical entrypoints are:
+The TCGA workflow separates PMD detection from downstream machine-learning
+submission:
 
 ```bash
-cd analysis/05_tcga_classification_analysis/slurm_code
-./run_PMD_detection.sh
-./run_tcga_ml_slurm.sh
+./analysis/05_tcga_classification_analysis/slurm_code/run_PMD_detection.sh --help
+./analysis/05_tcga_classification_analysis/slurm_code/run_tcga_ml_slurm.sh --help
 ```
 
-## Figures and notebooks
+## Citation
 
-The `figures/` directory contains the publication-oriented notebooks and shared
-helpers in `figures/utils/figures_utils.py`. The numbered notebooks generally
-mirror the numbered workflow areas in `analysis/`.
+If you use this repo, please cite the software using the
+[CITATION.cff](https://github.com/clementlab/MethylSeg/blob/main/CITATION.cff)
+metadata. On GitHub, select **Cite this repository** to copy the citation in APA
+or BibTeX format.
 
-`figures/04_region_calling_methylseg_comparison_deeptools.ipynb` is the cached
-deepTools companion notebook for the region-calling workflow, while several
-analysis folders still contain test or exploratory notebooks alongside the
-Python entrypoints.
+A manuscript describing MethylSeg is in preparation. Its citation will be added
+when available.
 
-Fix bug in methylseg 450k where it will call a region over the centromere with almost no data
+## License
+
+This repository is available under the
+[BSD 3-Clause License](LICENSE).
