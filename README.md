@@ -67,8 +67,15 @@ files, rather than every historical artifact in a working data directory.
 Git includes selected small reference files and metadata tables needed to
 define the analyses exactly, including the TCGA source and analyzed-sample
 manifests. Downloadable genomic tracks, bulk methylation arrays, WGBS files,
-signal tracks, and large derived lookups remain external and are identified by
-accession or source URL in the manifests.
+signal tracks, and other large derived artifacts remain external and are
+identified by accession or source URL in the manifests.
+
+The required HM450K lookup is distributed as a compressed file. Expand it once
+before running the region-calling or TCGA workflows:
+
+```bash
+gzip -dk data/reference_data/parse450K.pl.order.lookup.gz
+```
 
 Analysis outputs are written below `results/`. This can be an ordinary
 directory or a symlink to larger scratch storage:

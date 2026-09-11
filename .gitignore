@@ -22,6 +22,7 @@ data/reference_data/*
 !data/reference_data/data_manifest.tsv
 !data/reference_data/hg19ToHg38.over.chain
 !data/reference_data/liftover_bed.r
+!data/reference_data/parse450K.pl.order.lookup.gz
 !data/reference_data/runAll.sh.samples
 !data/tcga_samples/
 data/tcga_samples/*
