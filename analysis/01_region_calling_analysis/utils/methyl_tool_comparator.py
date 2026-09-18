@@ -1157,19 +1157,12 @@ class MethylSegPathway(MicroArrayPathway):
         methyl_seg_config=FILES / Path("methyl_seg_config.yaml"),
         wgbs_window_specs=[
             (500, "500bp"),
-            # (10_000, "10kb"),
             (40_000, "40kb"),
             (450_000, "450kb"),
-            # (500_000, "500kb"),
-            # (1_000_000, "1Mb"),
         ],
         hm450_window_specs=[
-            # (5000, "5kb"),
-            # (10_000, "10kb"),
             (40_000, "40kb"),
             (450_000, "450kb"),
-            # (500_000, "500kb"),
-            # (1_000_000, "1Mb"),
         ],
         min_coverage=10,
         n_states=4,
@@ -1709,7 +1702,6 @@ class MethylSegPathway(MicroArrayPathway):
                     "fit_methyl_seg": self.fit_methyl_seg,
                     "methyl_seg_config_path": self.methyl_seg_config,
                     "train_sample": self.train_sample,
-                    "train_chrom": self.train_chrom,
                     "random_state": self.random_state,
                 },
                 "platforms": {

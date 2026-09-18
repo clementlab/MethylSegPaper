@@ -2025,16 +2025,47 @@ def save_publication_figure(
     filename: str,
     *,
     dpi: int = 300,
-    save_pdf: bool = False,
+    save_pdf: bool = True,
+    pad_inches: float | None = None,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / filename
-    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    save_kwargs = {"dpi": dpi, "bbox_inches": "tight"}
+    if pad_inches is not None:
+        save_kwargs["pad_inches"] = pad_inches
+    fig.savefig(output_path, **save_kwargs)
 
     if save_pdf and output_path.suffix.lower() != ".pdf":
         pdf_path = output_path.with_suffix(".pdf")
-        fig.savefig(pdf_path, dpi=dpi, bbox_inches="tight")
+        fig.savefig(pdf_path, **save_kwargs)
+
+
+def save_plotly_figure(
+    fig: go.Figure,
+    output_dir: Path,
+    filename: str,
+    *,
+    save_pdf: bool = True,
+    width: int | None = None,
+    height: int | None = None,
+    scale: float = 1.0,
+) -> None:
+    """Save a Plotly figure and, by default, a same-stem PDF companion."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / filename
+    write_kwargs = {"width": width, "height": height, "scale": scale}
+    write_kwargs = {key: value for key, value in write_kwargs.items() if value is not None}
+
+    try:
+        fig.write_image(output_path, **write_kwargs)
+        if save_pdf and output_path.suffix.lower() != ".pdf":
+            fig.write_image(output_path.with_suffix(".pdf"), **write_kwargs)
+    except Exception as exc:
+        raise RuntimeError(
+            "Plotly static export requires python-kaleido and a discoverable Chrome or Chromium executable."
+        ) from exc
 
 
 def plot_synthetic_metric_bar(
@@ -2956,6 +2987,10 @@ def get_lad_combined_summary_df() -> pd.DataFrame:
 
 def get_lad_null_summary_df() -> pd.DataFrame:
     return _read_lad_table("lad_null_summary.tsv")
+
+
+def get_lad_null_region_distribution_details_df() -> pd.DataFrame:
+    return _read_lad_table("lad_null_region_distribution_details.tsv")
 
 
 def get_lad_unique_lad_exports_df() -> pd.DataFrame:

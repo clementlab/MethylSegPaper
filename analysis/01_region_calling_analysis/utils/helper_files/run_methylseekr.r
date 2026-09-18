@@ -95,7 +95,7 @@ message("Rows: ", nrow(meth_data))
 
 gr <- GRanges(
   seqnames = meth_data$chr,
-  ranges   = IRanges(start = meth_data$start, end = meth_data$start),
+  ranges   = IRanges(start = meth_data$start+1, end = meth_data$start+1), #convert to 1 based
   strand   = "*",
   T        = meth_data$coverage,
   M        = meth_data$meth
@@ -142,7 +142,7 @@ start_time <- proc.time()
 
 PMDsegments.gr <- segmentPMDs(
   m           = gr,
-  chr.sel     = "chr1",   # match notebook behavior
+  chr.sel     = "chr1",   
   seqLengths = sLengths,
   num.cores  = cores
 )

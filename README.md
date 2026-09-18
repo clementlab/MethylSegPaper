@@ -14,6 +14,7 @@ and the notebooks used to assemble the resulting figures.
 
 | Location | Purpose |
 | --- | --- |
+| [`analysis/00_methylseg_development/`](analysis/00_methylseg_development/) | Archive of the historical random parameter sweep used to choose early MethylSeg defaults. |
 | [`analysis/01_region_calling_analysis/`](analysis/01_region_calling_analysis/) | Compare MethylSeg with other PMD callers and aggregate their outputs. |
 | [`analysis/02_synthetic_analysis/`](analysis/02_synthetic_analysis/) | Generate synthetic PMDs and measure caller recovery. |
 | [`analysis/03_chromatin_analysis/`](analysis/03_chromatin_analysis/) | Analyze chromatin overlap and deepTools profiles. |
@@ -103,6 +104,19 @@ data and analysis results.
 
 Run commands from the repository root after activating the environment and
 staging the required inputs.
+
+### Historical MethylSeg parameter development
+
+The code used for the original random parameter sweep is archived under
+[`analysis/00_methylseg_development/`](analysis/00_methylseg_development/).
+Its cached summary tables and figures are stored locally under the ignored
+`results/00_methylseg_development/random_parallel_sweep/` directory. The
+figure-browser notebook is maintained for inspecting those relocated results.
+
+The sweep runner itself is retained for provenance and may not execute against
+the current repository and MethylSeg versions because several legacy helper
+modules and interfaces have changed. See the archive README for the retained
+result types, omissions, and compatibility limitations.
 
 ### Region-calling benchmark
 

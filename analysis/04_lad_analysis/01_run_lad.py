@@ -83,6 +83,29 @@ DNMTOOLS_METHYLSEG_COMPARISONS = [
     {"comparison_tool": "dnmtools_array", "reference_methylseg_tool": "methylseg_hm450k"},
 ]
 NULL_MODEL_CANONICAL_CHROMS = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
+NULL_DISTRIBUTION_FOCUS_TOOLS = {"methylseg", "methylseg_hm450k"}
+NULL_REGION_DISTRIBUTION_DETAIL_COLUMNS = [
+    "source",
+    "tool",
+    "sample",
+    "genome",
+    "null_perm_idx",
+    "region_id",
+    "chrom",
+    "start",
+    "end",
+    "region_length",
+    "dist_to_lad",
+    "dist_to_lad_boundary",
+    "n_lad_overlaps",
+    "lad_overlap_fraction",
+    "overlaps_lad",
+    "overlaps_lad_gte_150kb",
+    "is_non_overlapping",
+    "boundary_within_150kb",
+    "non_overlapping_boundary_within_150kb",
+    "shares_lad",
+]
 CHROM_SIZES_PATHS = {
     "hg19": REFERENCE_DATA_DIR / "hg19.chrom.sizes",
     "hg38": REFERENCE_DATA_DIR / "hg38.chrom.sizes",
@@ -1288,9 +1311,56 @@ def randomize_regions_matched_null(regions_df, chrom_sizes, rng):
     return randomized_df
 
 
-def compute_lad_null_metrics(overlaps_df, regions_df, lad_df):
-    metrics_df = get_overlap_scores(overlaps_df, regions_df, lad_df)
+def compute_lad_null_metrics(overlaps_df, regions_df, lad_df, *, dist_df=None):
+    metrics_df = get_overlap_scores(overlaps_df, regions_df, lad_df, dist_df=dist_df)
     return {metric: metrics_df.iloc[0][metric] for metric in NULL_METRICS}
+
+
+def build_lad_null_region_distribution_detail_df(overlaps_df, regions_df, lad_df, *, dist_df=None):
+    """Return the PMD-level values required by focused null-distribution figures."""
+    if dist_df is None:
+        dist_df = compute_region_lad_distances_or_empty(overlaps_df, regions_df, lad_df)
+
+    detail_df = build_region_lad_distance_detail_df(regions_df, dist_df)
+    if detail_df.empty:
+        return detail_df.assign(
+            n_lad_overlaps=pd.Series(dtype=float),
+            lad_overlap_fraction=pd.Series(dtype=float),
+            overlaps_lad=pd.Series(dtype=bool),
+            overlaps_lad_gte_150kb=pd.Series(dtype=bool),
+            is_non_overlapping=pd.Series(dtype=bool),
+            boundary_within_150kb=pd.Series(dtype=bool),
+            non_overlapping_boundary_within_150kb=pd.Series(dtype=bool),
+            shares_lad=pd.Series(dtype=bool),
+        )
+
+    overlap_bp = overlaps_df.groupby("region_id")["overlap_bp"].sum()
+    n_lad_overlaps = overlaps_df.groupby("region_id")["lad_id"].nunique()
+    lad_counts = overlaps_df.groupby("lad_id")["region_id"].nunique()
+    shared_lad_ids = set(lad_counts.loc[lad_counts > 1].index)
+    shared_region_ids = set(
+        overlaps_df.loc[overlaps_df["lad_id"].isin(shared_lad_ids), "region_id"].dropna()
+    )
+
+    detail_df["n_lad_overlaps"] = (
+        detail_df["region_id"].map(n_lad_overlaps).fillna(0).astype(int)
+    )
+    detail_df["total_lad_overlap_bp"] = detail_df["region_id"].map(overlap_bp).fillna(0.0)
+    detail_df["lad_overlap_fraction"] = np.divide(
+        detail_df["total_lad_overlap_bp"].to_numpy(dtype=float),
+        detail_df["region_length"].to_numpy(dtype=float),
+        out=np.zeros(len(detail_df), dtype=float),
+        where=detail_df["region_length"].to_numpy(dtype=float) > 0,
+    )
+    detail_df["overlaps_lad"] = detail_df["n_lad_overlaps"].gt(0)
+    detail_df["overlaps_lad_gte_150kb"] = detail_df["total_lad_overlap_bp"].ge(150_000)
+    detail_df["is_non_overlapping"] = detail_df["dist_to_lad"].gt(0)
+    detail_df["boundary_within_150kb"] = detail_df["dist_to_lad_boundary"].le(150_000)
+    detail_df["non_overlapping_boundary_within_150kb"] = (
+        detail_df["is_non_overlapping"] & detail_df["boundary_within_150kb"]
+    )
+    detail_df["shares_lad"] = detail_df["region_id"].isin(shared_region_ids)
+    return detail_df.drop(columns="total_lad_overlap_bp")
 
 
 def regions_have_no_overlap(interval_df):
@@ -1320,9 +1390,25 @@ def _run_single_lad_null_permutation(args):
     permuted_overlaps_df = filter_regions_by_lad_overlap(
         permuted_regions_df.copy(), lad_df_sample.copy()
     )
-    permuted_metrics = compute_lad_null_metrics(
-        permuted_overlaps_df, permuted_regions_df, lad_df_sample.copy()
+    permuted_distance_df = compute_region_lad_distances_or_empty(
+        permuted_overlaps_df,
+        permuted_regions_df,
+        lad_df_sample,
     )
+    permuted_metrics = compute_lad_null_metrics(
+        permuted_overlaps_df,
+        permuted_regions_df,
+        lad_df_sample.copy(),
+        dist_df=permuted_distance_df,
+    )
+    region_distribution_detail_df = None
+    if args.get("collect_region_distribution_details", False):
+        region_distribution_detail_df = build_lad_null_region_distribution_detail_df(
+            permuted_overlaps_df,
+            permuted_regions_df,
+            lad_df_sample,
+            dist_df=permuted_distance_df,
+        )
 
     observed_chrom_counts = observed_regions_df["chrom"].value_counts().sort_index()
     permuted_chrom_counts = permuted_regions_df["chrom"].value_counts().sort_index()
@@ -1356,6 +1442,7 @@ def _run_single_lad_null_permutation(args):
 
     return {
         "perm_idx": perm_idx,
+        "region_distribution_detail_df": region_distribution_detail_df,
         **{
             NULL_METRIC_NULL_COLUMN_MAP[metric]: permuted_metrics[metric]
             for metric in NULL_METRICS
@@ -1372,6 +1459,7 @@ def _run_lad_null_job(args):
     lad_df_sample = args["lad_df_sample"].copy()
     chrom_sizes = args["chrom_sizes"]
     permutation_seeds = args["permutation_seeds"]
+    collect_region_distribution_details = tool in NULL_DISTRIBUTION_FOCUS_TOOLS
 
     status = "ok"
     error_message = ""
@@ -1389,14 +1477,48 @@ def _run_lad_null_job(args):
         status = "empty"
         observed_metrics = {metric: np.nan for metric in NULL_METRICS}
         permutation_rows = []
+        observed_region_distribution_detail_df = pd.DataFrame(
+            columns=NULL_REGION_DISTRIBUTION_DETAIL_COLUMNS
+        )
+        randomized_region_distribution_detail_parts = []
     else:
         observed_overlaps_df = filter_regions_by_lad_overlap(
             observed_regions_df.copy(), lad_df_sample.copy()
         )
-        observed_metrics = compute_lad_null_metrics(
-            observed_overlaps_df, observed_regions_df.copy(), lad_df_sample.copy()
+        observed_distance_df = compute_region_lad_distances_or_empty(
+            observed_overlaps_df,
+            observed_regions_df,
+            lad_df_sample,
         )
+        observed_metrics = compute_lad_null_metrics(
+            observed_overlaps_df,
+            observed_regions_df.copy(),
+            lad_df_sample.copy(),
+            dist_df=observed_distance_df,
+        )
+        if collect_region_distribution_details:
+            observed_region_distribution_detail_df = (
+                build_lad_null_region_distribution_detail_df(
+                    observed_overlaps_df,
+                    observed_regions_df,
+                    lad_df_sample,
+                    dist_df=observed_distance_df,
+                )
+                .assign(
+                    source="observed",
+                    tool=tool,
+                    sample=sample,
+                    genome=genome,
+                    null_perm_idx=pd.NA,
+                )
+                .loc[:, NULL_REGION_DISTRIBUTION_DETAIL_COLUMNS]
+            )
+        else:
+            observed_region_distribution_detail_df = pd.DataFrame(
+                columns=NULL_REGION_DISTRIBUTION_DETAIL_COLUMNS
+            )
         permutation_rows = []
+        randomized_region_distribution_detail_parts = []
         try:
             for perm_idx, seed in enumerate(permutation_seeds):
                 perm_result = _run_single_lad_null_permutation(
@@ -1406,6 +1528,7 @@ def _run_lad_null_job(args):
                         "observed_regions_df": observed_regions_df.copy(),
                         "lad_df_sample": lad_df_sample.copy(),
                         "chrom_sizes": chrom_sizes,
+                        "collect_region_distribution_details": collect_region_distribution_details,
                     }
                 )
                 for flag_name in check_flags:
@@ -1424,6 +1547,17 @@ def _run_lad_null_job(args):
                         },
                     }
                 )
+                if collect_region_distribution_details:
+                    randomized_detail_df = perm_result["region_distribution_detail_df"]
+                    randomized_region_distribution_detail_parts.append(
+                        randomized_detail_df.assign(
+                            source="randomized",
+                            tool=tool,
+                            sample=sample,
+                            genome=genome,
+                            null_perm_idx=int(perm_result["perm_idx"]),
+                        ).loc[:, NULL_REGION_DISTRIBUTION_DETAIL_COLUMNS]
+                    )
                 completed_permutations += 1
         except Exception as exc:
             status = "failed"
@@ -1448,10 +1582,17 @@ def _run_lad_null_job(args):
         "n_permutations_completed": completed_permutations,
         **check_flags,
     }
+    randomized_region_distribution_detail_df = (
+        pd.concat(randomized_region_distribution_detail_parts, ignore_index=True)
+        if randomized_region_distribution_detail_parts
+        else pd.DataFrame(columns=NULL_REGION_DISTRIBUTION_DETAIL_COLUMNS)
+    )
     return {
         "observed_row": observed_row,
         "permutation_rows": permutation_rows,
         "check_row": check_row,
+        "observed_region_distribution_detail_df": observed_region_distribution_detail_df,
+        "randomized_region_distribution_detail_df": randomized_region_distribution_detail_df,
     }
 
 
@@ -1467,6 +1608,7 @@ def run_lad_null_model(
     lad_null_observed_rows = []
     lad_null_permutation_rows = []
     lad_null_check_rows = []
+    lad_null_region_distribution_detail_parts = []
     master_rng = np.random.default_rng(null_seed)
     process_pool_context = multiprocessing.get_context("fork")
     n_workers = max(1, (os.cpu_count() or 1) - 1)
@@ -1514,6 +1656,12 @@ def run_lad_null_model(
         lad_null_observed_rows.append(job_result["observed_row"])
         lad_null_permutation_rows.extend(job_result["permutation_rows"])
         lad_null_check_rows.append(job_result["check_row"])
+        lad_null_region_distribution_detail_parts.extend(
+            [
+                job_result["observed_region_distribution_detail_df"],
+                job_result["randomized_region_distribution_detail_df"],
+            ]
+        )
 
     lad_null_permutation_df = pd.DataFrame(
         lad_null_permutation_rows,
@@ -1599,7 +1747,18 @@ def run_lad_null_model(
             )
 
     lad_null_summary_df = pd.DataFrame(summary_rows)
-    return lad_null_observed_df, lad_null_permutation_df, lad_null_summary_df, lad_null_checks_df
+    lad_null_region_distribution_detail_df = (
+        pd.concat(lad_null_region_distribution_detail_parts, ignore_index=True)
+        if lad_null_region_distribution_detail_parts
+        else pd.DataFrame(columns=NULL_REGION_DISTRIBUTION_DETAIL_COLUMNS)
+    )
+    return (
+        lad_null_observed_df,
+        lad_null_permutation_df,
+        lad_null_summary_df,
+        lad_null_checks_df,
+        lad_null_region_distribution_detail_df,
+    )
 
 
 def prepare_lad_reference(
@@ -2156,6 +2315,7 @@ def run(
         lad_null_permutation_df,
         lad_null_summary_df,
         lad_null_checks_df,
+        lad_null_region_distribution_detail_df,
     ) = run_lad_null_model(
         samples=samples,
         sample_genome_lookup=sample_genome_lookup,
@@ -2168,10 +2328,16 @@ def run(
     lad_null_permutations_path = tables_dir / "lad_null_permutations.tsv"
     lad_null_summary_path = tables_dir / "lad_null_summary.tsv"
     lad_null_checks_path = tables_dir / "lad_null_run_checks.tsv"
+    lad_null_region_distribution_details_path = tables_dir / "lad_null_region_distribution_details.tsv"
     lad_null_observed_df.to_csv(lad_null_observed_path, sep="\t", index=False)
     lad_null_permutation_df.to_csv(lad_null_permutations_path, sep="\t", index=False)
     lad_null_summary_df.to_csv(lad_null_summary_path, sep="\t", index=False)
     lad_null_checks_df.to_csv(lad_null_checks_path, sep="\t", index=False)
+    lad_null_region_distribution_detail_df.to_csv(
+        lad_null_region_distribution_details_path,
+        sep="\t",
+        index=False,
+    )
 
     combined_summary_df = (
         metrics_df.groupby(
@@ -2483,6 +2649,7 @@ def run(
     print(f"  Null permutations: {lad_null_permutations_path}")
     print(f"  Null summary:      {lad_null_summary_path}")
     print(f"  Null checks:       {lad_null_checks_path}")
+    print(f"  Null PMD details:  {lad_null_region_distribution_details_path}")
     print(f"  Combined summary:  {lad_combined_summary_path}")
     print(f"  Plot manifest:     {lad_plot_outputs_path}")
     print(f"  Profile outputs:   {lad_profile_outputs_path}")
