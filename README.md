@@ -1,5 +1,7 @@
 # MethylSegPaper
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22904749.svg)](https://doi.org/10.5281/zenodo.22904749)
+
 This repository contains the analysis workflows and figure notebooks used to
 benchmark [MethylSeg](https://github.com/clementlab/MethylSeg) and study its
 downstream biological applications. It is a companion analysis repository,
